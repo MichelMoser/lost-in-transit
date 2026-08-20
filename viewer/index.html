@@ -24,11 +24,23 @@
       #language { font-size: 12px; padding: 2px 4px; }
       #panel label { display: block; margin-top: 8px; font-weight: 600; }
       #panel input[type="range"] { width: 100%; }
+      #panel input[type="text"] { width: 100%; box-sizing: border-box; padding: 5px 6px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; }
       #panel .row { display: flex; justify-content: space-between; }
+      #modeSwitch { display: flex; margin-top: 8px; border: 1px solid #ccc; border-radius: 6px; overflow: hidden; }
+      #modeSwitch button {
+        flex: 1 1 0;
+        display: flex; align-items: center; justify-content: center; gap: 5px;
+        padding: 6px 4px;
+        font-size: 12px; font-weight: 600;
+        border: none; background: #f4f4f4; color: #555;
+        cursor: pointer;
+      }
+      #modeSwitch button + button { border-left: 1px solid #ccc; }
+      #modeSwitch button[aria-pressed="true"] { background: #111; color: #fff; }
       #status { margin-top: 8px; color: #444; white-space: pre-line; }
-      #legend { margin-top: 10px; display: grid; gap: 3px; }
-      #legend div { display: flex; align-items: center; gap: 6px; }
-      #legend span.swatch { width: 12px; height: 3px; display: inline-block; }
+      #legendTransit, #legendCar { margin-top: 10px; display: grid; gap: 3px; }
+      #legendTransit div, #legendCar div { display: flex; align-items: center; gap: 6px; }
+      #legendTransit span.swatch, #legendCar span.swatch { width: 12px; height: 3px; display: inline-block; flex: 0 0 auto; }
       #tooltip {
         position: absolute;
         z-index: 20;
@@ -69,11 +81,24 @@
           <option value="de">DE</option>
         </select>
       </div>
-      <p id="appHint" style="margin: 0; color: #555;">Click the map to search from the nearest stop.</p>
+      <div id="modeSwitch">
+        <button id="modeTransit" type="button" aria-pressed="true">🚌 <span id="modeTransitLabel">Public transport</span></button>
+        <button id="modeCar" type="button" aria-pressed="false">🚗 <span id="modeCarLabel">Car</span></button>
+      </div>
+
+      <p id="appHint" style="margin: 8px 0 0; color: #555;">Click the map to search from the nearest stop.</p>
       <p id="originDisplay" style="display:none; margin: 8px 0 0; padding: 6px 8px; background: #eef3fb; border-left: 3px solid #111; border-radius: 4px; font-weight: 700; font-size: 13px; color: #111;"></p>
 
-      <label id="departureLabel" for="departure">Departure time</label>
-      <input id="departure" type="time" value="08:00" />
+      <div id="stopSearchRow">
+        <label id="stopSearchLabel" for="stopSearch">Or search a stop by name</label>
+        <input id="stopSearch" type="text" list="stopSearchOptions" autocomplete="off" placeholder="Start typing a stop name…" />
+        <datalist id="stopSearchOptions"></datalist>
+      </div>
+
+      <div id="departureRow">
+        <label id="departureLabel" for="departure">Departure time</label>
+        <input id="departure" type="time" value="08:00" />
+      </div>
 
       <label for="budget">
         <span class="row"><span id="budgetLabel">Budget</span><span id="budgetValue">60 min</span></span>
@@ -98,7 +123,7 @@
         <div style="height:8px; border-radius:4px; background:linear-gradient(90deg, hsl(130,75%,45%), hsl(65,75%,45%), hsl(0,75%,45%));"></div>
       </div>
 
-      <div id="legend">
+      <div id="legendTransit">
         <div><span class="swatch" style="background:#c0392b"></span><span id="legendRail">Rail</span></div>
         <div><span class="swatch" style="background:#e67e22"></span><span id="legendBus">Bus</span></div>
         <div><span class="swatch" style="background:#2980b9"></span><span id="legendTram">Tram/Metro</span></div>
@@ -106,9 +131,16 @@
         <div><span class="swatch" style="background:#8e44ad"></span><span id="legendCableCar">Cable car/Funicular</span></div>
         <div><span class="swatch" style="background:#999;border-top:1px dashed #999;height:0"></span><span id="legendWalking">Walking transfer</span></div>
       </div>
+      <div id="legendCar" style="display:none;">
+        <div><span class="swatch" style="background:#555"></span><span id="legendMotorway">Motorway / expressway</span></div>
+        <div id="legendCarNote" style="margin-top:4px; font-size:11px; color:#777; font-weight:400;">
+          Only the motorway/expressway network is routed; colour beyond it is an estimate for local roads.
+        </div>
+      </div>
 
       <p style="margin-top:10px; padding-top:8px; border-top:1px solid #ddd; font-size:10px; color:#888; line-height:1.4;">
         Timetable data © <a href="https://opentransportdata.swiss/" target="_blank" rel="noopener">opentransportdata.swiss</a>.
+        Road data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>.
         Map © <a href="https://www.swisstopo.admin.ch/" target="_blank" rel="noopener">swisstopo</a>.
       </p>
     </div>

@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "build:snapshot": "node scripts/build-snapshot.mjs",
+    "build:road-network": "node scripts/build-road-network.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

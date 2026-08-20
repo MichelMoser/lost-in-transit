@@ -19,6 +19,7 @@ import { createReadStream, mkdirSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { wgs84ToLv95 } from './lib/geo.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = resolve(HERE, '../data/extracted');
@@ -112,30 +113,6 @@ function splitCsvLine(line) {
 function parseGtfsTime(value) {
   const [hours, minutes, seconds] = value.split(':').map(Number);
   return hours * 3600 + minutes * 60 + seconds;
-}
-
-/**
- * Converts WGS84 degrees to Swiss LV95 (EPSG:2056) using swisstopo's
- * published approximate formula — accurate to about 1 metre, well inside
- * what a transit stop marker needs.
- */
-function wgs84ToLv95(lat, lon) {
-  const latSec = (lat * 3600 - 169028.66) / 10000;
-  const lonSec = (lon * 3600 - 26782.5) / 10000;
-  const easting =
-    2600072.37 +
-    211455.93 * lonSec -
-    10938.51 * lonSec * latSec -
-    0.36 * lonSec * latSec ** 2 -
-    44.54 * lonSec ** 3;
-  const northing =
-    1200147.07 +
-    308807.95 * latSec +
-    3745.25 * lonSec ** 2 +
-    76.63 * latSec ** 2 -
-    194.56 * lonSec ** 2 * latSec +
-    119.79 * latSec ** 3;
-  return [Math.round(easting), Math.round(northing)];
 }
 
 // --- Pass 1: which services run on the reference date -----------------

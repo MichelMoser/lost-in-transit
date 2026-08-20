@@ -1,14 +1,14 @@
 # Transit reachability
 
-Public-transport version of viatopo's walking "reachable area" search:
-given a start point and a time budget, show everywhere reachable by
-train, bus, tram, boat, cable car, and funicular — the same idea as the
-walking kraken, but for transit.
+Given a start point and a time budget, show everywhere reachable — by
+train, bus, tram, boat, cable car, and funicular, or by car — the same idea
+as viatopo's walking "reachable area" search, for transit and driving.
 
-## Data source
+## Data sources
 
-[opentransportdata.swiss](https://opentransportdata.swiss/) GTFS Switzerland
-feed (mirrored for convenience at https://gtfs.geops.ch/dl/gtfs_complete.zip).
+**Public transport**: [opentransportdata.swiss](https://opentransportdata.swiss/)
+GTFS Switzerland feed (mirrored for convenience at
+https://gtfs.geops.ch/dl/gtfs_complete.zip).
 
 - Covers all Swiss public transport: rail, bus, tram, metro, ferry, cable
   car/gondola, funicular.
@@ -29,6 +29,23 @@ feed (mirrored for convenience at https://gtfs.geops.ch/dl/gtfs_complete.zip).
 - Decided with the project owner: national coverage from the start, not a
   regional pilot.
 
+**Driving**: [OpenStreetMap](https://www.openstreetmap.org/copyright), the
+motorway + trunk tiers (Switzerland's autoroute/Autobahn and
+expressway/Autostrasse network), fetched via the
+[Overpass API](https://overpass-api.de/). Attribution required (ODbL): "©
+OpenStreetMap contributors".
+
+- Deliberately not every street: a full national road graph is millions of
+  edges, too large for a client-side snapshot with no backend, and "using
+  autoroutes" was the brief. See `scripts/build-road-network.mjs`'s header
+  comment for the exact Overpass query and the scope trade-off this implies
+  — the isochrone reads as "how far the motorway/expressway network
+  reaches," widened by a flat estimated local-road buffer around each
+  reached junction, not a house-to-house result.
+- No traffic modelling — edge speeds come from each way's own `maxspeed`
+  tag, or a per-class default (120 km/h motorway, 80 km/h trunk, lower for
+  slip roads) when untagged.
+
 ## Status
 
 **Done and validated**:
@@ -38,10 +55,15 @@ feed (mirrored for convenience at https://gtfs.geops.ch/dl/gtfs_complete.zip).
 2. **RAPTOR router** (`src/raptor.ts`) — real, tested, reading that snapshot.
 3. **Walking-distance transfer fallback** — stops not linked by an explicit
    `transfers.txt` entry but within 300m still connect.
-4. **Standalone test viewer** (`viewer/`) — a real browser page proving the
-   whole thing works end to end, verified with a headless-browser check.
+4. **Road-network pipeline** (`scripts/build-road-network.mjs`) — turns a
+   cached Overpass export into a compact directed graph.
+5. **Dijkstra driving router** (`src/carRouter.ts`) — real, tested, the
+   driving counterpart of the RAPTOR router.
+6. **Standalone test viewer** (`viewer/`) — a real browser page proving both
+   modes work end to end, verified with headless-browser checks, with a
+   Google-Maps-style switch between them.
 
-Real numbers from a run against 2026-08-19 (a Wednesday):
+Real transit numbers from a run against 2026-08-19 (a Wednesday):
 
 | Stage | Count |
 |---|---|
@@ -73,9 +95,33 @@ from central Bern, walking transfers included.
 the real national snapshot (not part of `npm test` — needs `data/output/` to
 exist first).
 
+Real road-network numbers (motorway + trunk, including slip roads):
+
+| Stage | Count |
+|---|---|
+| OSM ways in the Overpass export | 18,219 |
+| Distinct nodes used | 148,605 |
+| Directed edges (one-way ways contribute one, two-way contribute two) | 158,747 |
+
+Output (`data/output/road-network/`, gitignored — regenerate with
+`npm run build:road-network` once `data/osm-roads-switzerland.json` exists —
+see `scripts/build-road-network.mjs`'s header for the Overpass query):
+
+- `nodes.json` (2.3 MB) — LV95 coordinates, one entry per used node.
+- `edges.bin` (1.9 MB) — every directed edge as a packed `(uint32 from,
+  uint32 to, float32 travelSeconds)` triple.
+
+Builds in well under a second from the cached Overpass export. A search
+(`findReachableRoadNodes`) runs in **single-digit milliseconds** even
+reaching tens of thousands of junctions — 8ms for 45,278 junctions within 60
+minutes of central Zürich.
+
+`src/carRouter.ts` has 4 unit tests against small hand-built graphs
+(`src/carRouter.test.ts`).
+
 ### Bugs found by testing against real data, not just hand-built cases
 
-Four, across the data pipeline and the viewer — worth recording, since none
+Six, across the data pipeline and the viewer — worth recording, since none
 of them would have surfaced from small examples alone:
 
 1. **CSV quoting.** 57,602 rows in `stops.txt` alone contain a quote
@@ -112,6 +158,29 @@ of them would have surfaced from small examples alone:
    own codebase already sidesteps this by stating the LV95 tile grid
    directly (`src/map/lv95.ts`) rather than parsing it from capabilities;
    `viewer/src/main.ts` copies that approach.
+5. **One splat per road node, not per stop, is a different order of
+   magnitude.** The isochrone hex-fill algorithm (`computeHexagons`) splats
+   a catchment circle from every reached point — fine for transit, where a
+   search reaches a few thousand stops at most. The driving router reaches
+   every node in the road graph it can afford, tens of thousands of them,
+   many mere metres apart along the same carriageway; splatting each one
+   independently, several with almost the entire budget still spare (every
+   junction near the origin), froze the browser tab for over a minute on a
+   single click. Fixed two ways: bucketing reached nodes onto the same hex
+   grid before splatting, keeping only the earliest arrival per cell (caps
+   the splat count at the network's own footprint rather than its node
+   count), and capping how much leftover budget counts toward any one
+   splat's radius (`CAR_CATCHMENT_CAP_SECONDS`, 15 minutes) — nobody
+   detours 50 km onto back roads from a motorway exit anyway, so the cap is
+   the more realistic answer as well as the fast one. Found by testing an
+   actual 60-minute search, not the small hand-built graphs the unit tests
+   use — those never reach a node count where this mattered.
+6. **`ol/Map` and the built-in `Map` collection share a name.** `import Map
+   from 'ol/Map.js'` shadows JavaScript's own `Map` class for the rest of
+   the file — `new Map<string, number>()` for the stop-search index silently
+   resolved to OpenLayers' map constructor instead, caught immediately by
+   `tsc` rather than at runtime. Fixed by importing OpenLayers' class as
+   `OlMap`.
 
 ## Test viewer
 
@@ -145,11 +214,24 @@ Since the first version, it has grown:
   formatting.
 - **English / French / German** — `viewer/src/translations.ts`, a language
   switcher in the panel, persisted to `localStorage`.
+- **Driving mode** — a Google-Maps-style switch at the top of the panel
+  flips between public transport and car. Car mode runs `findReachableRoadNodes`
+  over the motorway/trunk graph instead of RAPTOR, draws the same isochrone
+  hex fill (with its own local-road catchment assumption, see the data
+  source section above) plus every reached road segment coloured on the
+  same green-to-red scale, and keeps each mode's own last result cached so
+  flipping back and forth redraws instantly rather than re-running a search.
+- **Manual stop entry** — a text input with autocomplete over every used
+  transit stop's name (transit mode only; road junctions have no name in
+  this data), so a reader who knows their starting point does not have to
+  find it on the map first.
 
-Verified end to end with a headless-browser check (Playwright, see
+Verified end to end with headless-browser checks (Playwright, see
 `viewer/README` notes below): basemap renders, a click resolves to the
-nearest stop, the search runs, legs and hexes draw correctly, hover
-itineraries and all three languages read correctly.
+nearest stop or road junction depending on mode, both searches run, legs
+and hexes draw correctly, the mode switch preserves each side's own result,
+stop-name search recentres the map and searches, hover itineraries and all
+three languages read correctly.
 
 ## Hosting (GitHub Pages)
 
@@ -183,17 +265,24 @@ Pages on every push to `main`. What that means concretely:
 1. ~~RAPTOR router~~ — done.
 2. ~~Walking-distance transfer fallback~~ — done.
 3. ~~Something to see it work in a browser~~ — done (the test viewer).
-4. **Worker + UI wiring inside viatopo itself.** The test viewer proves the
-   search works; it is not the shipped feature. Turning it into one means
+4. ~~Driving mode~~ — done (motorway/trunk network, see above).
+5. **Worker + UI wiring inside viatopo itself.** The test viewer proves both
+   searches work; neither is the shipped feature. Turning it into one means
    mirroring `dynamicRoutingWorker.ts` / `useReachabilityTool.ts` /
    `reachabilityDisplay.ts` from viatopo's walking feature: a worker holding
-   the loaded snapshot, a time-budget slider (likely 1–3 hours, since transit
-   covers far more ground than walking), and a map layer distinguishing mode
-   by colour the way the viewer already does. Comparable in size to the whole
+   the loaded snapshot(s), a time-budget slider (likely 1–3 hours for
+   transit, less for driving), and a map layer distinguishing mode by colour
+   the way the viewer already does. Comparable in size to the whole
    walking-feature port done earlier in `viatopo`.
-5. **Combining with viatopo's walking search** for the first/last-mile legs
-   of a real journey — right now the origin is "nearest stop," not "wherever
-   the reader actually clicked."
+6. **Combining with viatopo's walking search** for the first/last-mile legs
+   of a real journey — right now the origin is "nearest stop" or "nearest
+   motorway junction," not "wherever the reader actually clicked."
+7. **A real street network for driving.** The motorway/trunk-only graph
+   answers "how far does the expressway network reach," not "how far can I
+   actually drive" — the flat local-road catchment buffer is an honest
+   approximation, not the real thing. A fuller street graph would need
+   either a much larger client-side snapshot (millions of edges) or a
+   backend to route against, neither built here.
 6. **Where this lives long-term.** This folder is a standalone workspace for
    now. Once item 4 exists, the natural home for the shipped feature is
    inside the `viatopo` repo itself (`D:\WORK_MICHEL\VIATOPO\viatopo`),
@@ -204,16 +293,24 @@ Pages on every push to `main`. What that means concretely:
 
 ```
 data/
-  gtfs_switzerland.zip   raw feed (not committed anywhere — re-download to refresh)
-  extracted/             unzipped CSVs
-  output/                build-snapshot.mjs's output
+  gtfs_switzerland.zip          raw GTFS feed (not committed — re-download to refresh)
+  extracted/                     unzipped GTFS CSVs
+  osm-roads-switzerland.json    raw Overpass export (not committed — re-download to refresh)
+  output/
+    manifest.json, stops.json, stop-times.bin   build-snapshot.mjs's output
+    road-network/nodes.json, edges.bin          build-road-network.mjs's output
 scripts/
-  inspect.mjs            one-off exploration script (row counts, mode breakdown)
-  build-snapshot.mjs     the real data-prep pipeline
-  smoke-test.mjs         manual check against the real national snapshot
+  lib/geo.mjs             shared WGS84 -> LV95 conversion
+  inspect.mjs             one-off exploration script (row counts, mode breakdown)
+  build-snapshot.mjs      the transit data-prep pipeline
+  build-road-network.mjs  the driving data-prep pipeline
+  smoke-test.mjs          manual check against the real national snapshot
 src/
-  timetable.ts           snapshot -> queryable Timetable, shared by the router and viewer
-  raptor.ts               the search itself
-  raptor.test.ts          unit tests
-viewer/                   standalone Vite + OpenLayers page, see above
+  timetable.ts            snapshot -> queryable Timetable, shared by the router and viewer
+  raptor.ts                the transit search
+  raptor.test.ts           unit tests
+  roadNetwork.ts           snapshot -> queryable RoadNetwork
+  carRouter.ts              the driving search (Dijkstra)
+  carRouter.test.ts         unit tests
+viewer/                     standalone Vite + OpenLayers page, see above
 ```

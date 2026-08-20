@@ -1,11 +1,12 @@
 import { register } from 'ol/proj/proj4.js';
 import { get as getProjection } from 'ol/proj.js';
 import proj4 from 'proj4';
-import Map from 'ol/Map.js';
+import OlMap from 'ol/Map.js';
 import View from 'ol/View.js';
 import Feature from 'ol/Feature.js';
 import Point from 'ol/geom/Point.js';
 import LineString from 'ol/geom/LineString.js';
+import MultiLineString from 'ol/geom/MultiLineString.js';
 import Polygon from 'ol/geom/Polygon.js';
 import VectorLayer from 'ol/layer/Vector.js';
 import VectorSource from 'ol/source/Vector.js';
@@ -17,9 +18,13 @@ import type { MapBrowserEvent } from 'ol';
 
 import { loadTimetable, TransitMode, type Timetable } from '../../src/timetable';
 import { findReachableStops, type JourneySegment, type TransitReachability } from '../../src/raptor';
-import { computeIsochroneHexagons } from './isochrone';
+import { loadRoadNetwork, type RoadNetwork } from '../../src/roadNetwork';
+import { findReachableRoadNodes, type CarReachability } from '../../src/carRouter';
+import { computeTransitIsochroneHexagons, computeCarIsochroneHexagons } from './isochrone';
 import { formatJourneyHtml } from './journeyFormat';
 import { getLanguage, onLanguageChange, setLanguage, t, type Language } from './translations';
+
+type Mode = 'transit' | 'car';
 
 /** Official swisstopo LV95 WMTS coverage, in metres. */
 const LV95_WMTS_EXTENT = [2_420_000, 1_030_000, 2_900_000, 1_350_000];
@@ -45,6 +50,7 @@ lv95Projection.setExtent(LV95_WMTS_EXTENT);
 
 const statusElement = document.getElementById('status') as HTMLDivElement;
 const departureInput = document.getElementById('departure') as HTMLInputElement;
+const departureRowElement = document.getElementById('departureRow') as HTMLDivElement;
 const budgetInput = document.getElementById('budget') as HTMLInputElement;
 const budgetValueElement = document.getElementById('budgetValue') as HTMLSpanElement;
 const tooltipElement = document.getElementById('tooltip') as HTMLDivElement;
@@ -53,6 +59,15 @@ const showNetworkInput = document.getElementById('showNetwork') as HTMLInputElem
 const languageSelect = document.getElementById('language') as HTMLSelectElement;
 const originDisplayElement = document.getElementById('originDisplay') as HTMLParagraphElement;
 const isochroneEndElement = document.getElementById('isochroneEnd') as HTMLSpanElement;
+const modeTransitButton = document.getElementById('modeTransit') as HTMLButtonElement;
+const modeCarButton = document.getElementById('modeCar') as HTMLButtonElement;
+const stopSearchRowElement = document.getElementById('stopSearchRow') as HTMLDivElement;
+const stopSearchInput = document.getElementById('stopSearch') as HTMLInputElement;
+const stopSearchDatalist = document.getElementById('stopSearchOptions') as HTMLDataListElement;
+const legendTransitElement = document.getElementById('legendTransit') as HTMLDivElement;
+const legendCarElement = document.getElementById('legendCar') as HTMLDivElement;
+
+let currentMode: Mode = 'transit';
 
 function setStatus(message: string): void {
   statusElement.textContent = message;
@@ -60,13 +75,18 @@ function setStatus(message: string): void {
 
 /**
  * Re-applies every static label in the panel to the current language. Run
- * once at startup and again on every language change, since nothing here is
- * a reactive framework re-rendering that for us.
+ * once at startup and again on every language change or mode switch, since
+ * nothing here is a reactive framework re-rendering that for us.
  */
 function applyStaticText(): void {
   document.title = t('app.title');
   (document.getElementById('appTitle') as HTMLElement).textContent = t('app.title');
-  (document.getElementById('appHint') as HTMLElement).textContent = t('app.hint');
+  (document.getElementById('appHint') as HTMLElement).textContent =
+    currentMode === 'car' ? t('app.hint.car') : t('app.hint');
+  (document.getElementById('modeTransitLabel') as HTMLElement).textContent = t('mode.switch.transit');
+  (document.getElementById('modeCarLabel') as HTMLElement).textContent = t('mode.switch.car');
+  (document.getElementById('stopSearchLabel') as HTMLElement).textContent = t('stopSearch.label');
+  stopSearchInput.placeholder = t('stopSearch.placeholder');
   (document.getElementById('departureLabel') as HTMLElement).textContent = t('departure.label');
   (document.getElementById('budgetLabel') as HTMLElement).textContent = t('budget.label');
   (document.getElementById('showIsochroneLabel') as HTMLElement).textContent = t('layer.isochrone');
@@ -78,6 +98,8 @@ function applyStaticText(): void {
   (document.getElementById('legendFerry') as HTMLElement).textContent = t('legend.ferry');
   (document.getElementById('legendCableCar') as HTMLElement).textContent = t('legend.cableCar');
   (document.getElementById('legendWalking') as HTMLElement).textContent = t('legend.walking');
+  (document.getElementById('legendMotorway') as HTMLElement).textContent = t('legend.motorway');
+  (document.getElementById('legendCarNote') as HTMLElement).textContent = t('legend.carNote');
   updateBudgetLabels();
   languageSelect.value = getLanguage();
 }
@@ -130,7 +152,7 @@ function createBasemapLayer(projection: ReturnType<typeof getProjection>): TileL
   });
 }
 
-// --- Isochrone layer: the filled-area view, drawn under the line network. --
+// --- Isochrone layer: the filled-area view, shared by both modes. ----------
 const isochroneSource = new VectorSource();
 const isochroneLayer = new VectorLayer({ source: isochroneSource, zIndex: 5 });
 
@@ -139,8 +161,8 @@ const isochroneLayer = new VectorLayer({ source: isochroneSource, zIndex: 5 });
  * first stretch, through amber, to red as the deadline nears. The same
  * convention isochrone.ch itself uses, because a reader comparing this
  * against a tool they already know should not have to relearn a palette.
- * Shared between the isochrone hexes and the destination-tip markers so both
- * read as one consistent scale.
+ * Shared between the isochrone hexes, the transit tip markers, and the
+ * driving network's own road segments so all three read as one scale.
  */
 function elapsedHue(elapsedSeconds: number, budgetSeconds: number): number {
   const fraction = Math.min(Math.max(elapsedSeconds / budgetSeconds, 0), 1);
@@ -153,13 +175,19 @@ function isochroneFillStyle(elapsedSeconds: number, budgetSeconds: number): Styl
   });
 }
 
-// --- Reachability layer -----------------------------------------------------
+// --- Transit reachability layer (tip markers only) --------------------------
 const reachabilitySource = new VectorSource();
 const reachabilityLayer = new VectorLayer({ source: reachabilitySource, zIndex: 10 });
 
-/** The single route drawn to whichever tip is currently hovered — see `drawHoverRoute`. */
+/** The single transit route drawn to whichever tip is currently hovered — see `drawHoverRoute`. */
 const hoverRouteSource = new VectorSource();
 const hoverRouteLayer = new VectorLayer({ source: hoverRouteSource, zIndex: 8 });
+
+// --- Car reachability layer: every reached road segment, drawn immediately
+// (unlike transit's arms, the motorway/trunk graph is compact enough that
+// hover-gating would only hide information, not declutter anything). -------
+const carRoadSource = new VectorSource();
+const carRoadLayer = new VectorLayer({ source: carRoadSource, zIndex: 8 });
 
 const MODE_COLORS: Record<number, string> = {
   [TransitMode.Tram]: '#2980b9',
@@ -184,6 +212,13 @@ function legStyle(mode: number | 'transfer'): Style {
   });
 }
 
+/** Road segments are coloured on the same green-to-red scale as everything else, by arrival time at their far end. */
+function carRoadStyle(elapsedSeconds: number, budgetSeconds: number): Style {
+  return new Style({
+    stroke: new Stroke({ color: `hsl(${elapsedHue(elapsedSeconds, budgetSeconds)}, 75%, 45%)`, width: 3 }),
+  });
+}
+
 const ORIGIN_STYLE = new Style({
   image: new CircleStyle({
     radius: 8,
@@ -194,10 +229,10 @@ const ORIGIN_STYLE = new Style({
 });
 
 /**
- * A tip: the far end of one arm, where no further leg continues outward.
- * Filled with the same green-to-red hue as the isochrone hex it sits in, so
- * a reader can read "how much budget is left here" from the dot alone
- * without having to hover.
+ * A tip: the far end of one transit arm, where no further leg continues
+ * outward. Filled with the same green-to-red hue as the isochrone hex it
+ * sits in, so a reader can read "how much budget is left here" from the dot
+ * alone without having to hover.
  */
 function tipStyle(elapsedSeconds: number, budgetSeconds: number, hovered: boolean): Style {
   const hue = elapsedHue(elapsedSeconds, budgetSeconds);
@@ -222,6 +257,10 @@ function coordinateOf(timetable: Timetable, stopIndex: number): [number, number]
   return [timetable.stopEastings[stopIndex] ?? 0, timetable.stopNorthings[stopIndex] ?? 0];
 }
 
+function roadCoordinateOf(network: RoadNetwork, nodeIndex: number): [number, number] {
+  return [network.nodeEastings[nodeIndex] ?? 0, network.nodeNorthings[nodeIndex] ?? 0];
+}
+
 /**
  * Finds every stop the search reached that no drawn leg continues onward
  * from — the actual tip of its arm, rather than a junction passed through on
@@ -232,11 +271,11 @@ function findTipStops(result: TransitReachability): TransitReachability['stops']
   return result.stops.filter((stop) => !stopsWithOutgoingLeg.has(stop.stopIndex));
 }
 
-function drawIsochrone(timetable: Timetable, result: TransitReachability): void {
+function drawTransitIsochrone(timetable: Timetable, result: TransitReachability): void {
   isochroneSource.clear();
 
   const start = performance.now();
-  const hexagons = computeIsochroneHexagons(timetable, result);
+  const hexagons = computeTransitIsochroneHexagons(timetable, result);
 
   for (const hex of hexagons) {
     const feature = new Feature({ geometry: new Polygon([hex.ring]) });
@@ -255,7 +294,7 @@ function drawIsochrone(timetable: Timetable, result: TransitReachability): void 
  * scale); `drawHoverRoute` below draws the one route to whichever tip is
  * currently hovered instead.
  */
-function drawReachability(timetable: Timetable, result: TransitReachability): void {
+function drawTransitReachability(timetable: Timetable, result: TransitReachability): void {
   reachabilitySource.clear();
 
   for (const stop of findTipStops(result)) {
@@ -308,7 +347,74 @@ function drawHoverRoute(
   }
 }
 
-// --- Nearest-stop lookup: brute force, fine for one click at a time. --------
+function drawCarIsochrone(network: RoadNetwork, result: CarReachability): void {
+  isochroneSource.clear();
+
+  const start = performance.now();
+  const hexagons = computeCarIsochroneHexagons(network, result);
+
+  for (const hex of hexagons) {
+    const feature = new Feature({ geometry: new Polygon([hex.ring]) });
+    feature.setStyle(isochroneFillStyle(hex.elapsedSeconds, result.budgetSeconds));
+    isochroneSource.addFeature(feature);
+  }
+
+  console.log(
+    `Car isochrone: ${hexagons.length.toLocaleString()} hexes in ${(performance.now() - start).toFixed(1)}ms`,
+  );
+}
+
+/** Distinct colour steps the reached road network is bucketed into — see `drawCarRoads`. */
+const CAR_ROAD_HUE_BUCKETS = 24;
+
+/**
+ * Draws every reached road segment plus the origin marker. A budget wide
+ * enough to reach most of the network can mean well over 100,000 directed
+ * edges; one OL `Feature` each would be enormously slow to style and render.
+ * Bucketing by elapsed time into a small, fixed number of colour steps and
+ * drawing each bucket as a single `MultiLineString` keeps the feature count
+ * (and so the render cost) constant regardless of how much was reached.
+ */
+function drawCarRoads(network: RoadNetwork, result: CarReachability): void {
+  carRoadSource.clear();
+
+  const arrivalByNode = new Map<number, number>();
+  for (const node of result.nodes) {
+    arrivalByNode.set(node.nodeIndex, node.arrivalSeconds);
+  }
+
+  const linesByBucket = new Map<number, [number, number][][]>();
+  for (const edge of result.edges) {
+    const elapsedSeconds = arrivalByNode.get(edge.toNodeIndex) ?? 0;
+    const fraction = Math.min(Math.max(elapsedSeconds / result.budgetSeconds, 0), 1);
+    const bucket = Math.round(fraction * (CAR_ROAD_HUE_BUCKETS - 1));
+
+    let lines = linesByBucket.get(bucket);
+    if (!lines) {
+      lines = [];
+      linesByBucket.set(bucket, lines);
+    }
+    lines.push([
+      roadCoordinateOf(network, edge.fromNodeIndex),
+      roadCoordinateOf(network, edge.toNodeIndex),
+    ]);
+  }
+
+  for (const [bucket, lines] of linesByBucket) {
+    const elapsedSeconds = (bucket / (CAR_ROAD_HUE_BUCKETS - 1)) * result.budgetSeconds;
+    const feature = new Feature({ geometry: new MultiLineString(lines) });
+    feature.setStyle(carRoadStyle(elapsedSeconds, result.budgetSeconds));
+    carRoadSource.addFeature(feature);
+  }
+
+  const originFeature = new Feature({
+    geometry: new Point(roadCoordinateOf(network, result.originNodeIndex)),
+  });
+  originFeature.setStyle(ORIGIN_STYLE);
+  carRoadSource.addFeature(originFeature);
+}
+
+// --- Nearest-point lookups: brute force, fine for one click at a time. ------
 function nearestUsedStopIndex(
   timetable: Timetable,
   easting: number,
@@ -335,6 +441,24 @@ function nearestUsedStopIndex(
   return bestIndex;
 }
 
+function nearestRoadNodeIndex(network: RoadNetwork, easting: number, northing: number): number | null {
+  let bestIndex: number | null = null;
+  let bestDistanceSquared = Infinity;
+
+  for (let nodeIndex = 0; nodeIndex < network.nodeEastings.length; nodeIndex += 1) {
+    const deltaEasting = (network.nodeEastings[nodeIndex] ?? 0) - easting;
+    const deltaNorthing = (network.nodeNorthings[nodeIndex] ?? 0) - northing;
+    const distanceSquared = deltaEasting ** 2 + deltaNorthing ** 2;
+
+    if (distanceSquared < bestDistanceSquared) {
+      bestDistanceSquared = distanceSquared;
+      bestIndex = nodeIndex;
+    }
+  }
+
+  return bestIndex;
+}
+
 function departureSecondsFromInput(): number {
   const [hours, minutes] = departureInput.value.split(':').map(Number);
   return (hours ?? 8) * 3600 + (minutes ?? 0) * 60;
@@ -344,7 +468,7 @@ async function main(): Promise<void> {
   applyStaticText();
   setStatus(t('status.loading'));
 
-  const [manifest, stops, stopTimesBuffer] = await Promise.all([
+  const [manifest, stops, stopTimesBuffer, roadNodes, roadEdgesBuffer] = await Promise.all([
     // Root-relative, not absolute: GitHub Pages serves this as a project
     // site under /<repo>/, so an absolute `/data/...` would miss the data
     // this same deploy carries and instead ask the domain's real root for
@@ -355,9 +479,16 @@ async function main(): Promise<void> {
     fetch(`${import.meta.env.BASE_URL}data/stop-times.bin`).then((response) =>
       response.arrayBuffer(),
     ),
+    fetch(`${import.meta.env.BASE_URL}data/road-network/nodes.json`).then((response) =>
+      response.json(),
+    ),
+    fetch(`${import.meta.env.BASE_URL}data/road-network/edges.bin`).then((response) =>
+      response.arrayBuffer(),
+    ),
   ]);
 
   const timetable = loadTimetable(manifest, stops, stopTimesBuffer);
+  const roadNetwork = loadRoadNetwork(roadNodes, roadEdgesBuffer);
 
   const basemapLayer = createBasemapLayer(lv95Projection);
   const view = new View({
@@ -366,33 +497,60 @@ async function main(): Promise<void> {
     zoom: 8,
   });
 
-  const map = new Map({
+  const map = new OlMap({
     target: 'map',
-    layers: [basemapLayer, isochroneLayer, hoverRouteLayer, reachabilityLayer],
+    layers: [basemapLayer, isochroneLayer, hoverRouteLayer, carRoadLayer, reachabilityLayer],
     view,
   });
 
-  let currentOriginIndex: number | null = null;
-  let currentResult: TransitReachability | null = null;
+  let transitOriginIndex: number | null = null;
+  let transitResult: TransitReachability | null = null;
+  let carOriginIndex: number | null = null;
+  let carResult: CarReachability | null = null;
   let lastSearchElapsedMs = 0;
   let hoveredTip: Feature | null = null;
 
   /**
    * Re-renders whatever the status line is currently saying — the loaded
-   * summary, or the last search's result — so a language change updates
-   * text already on screen instead of only the next thing said after it.
+   * summary, or the last search's result — so a language change or mode
+   * switch updates text already on screen instead of only the next thing
+   * said after it.
    */
   function refreshStatus(): void {
-    if (currentOriginIndex !== null && currentResult !== null) {
-      const originName = timetable.stopNames[currentOriginIndex] ?? '';
-      originDisplayElement.textContent = t('journey.from', { name: originName });
-      originDisplayElement.style.display = 'block';
+    if (currentMode === 'transit') {
+      if (transitOriginIndex !== null && transitResult !== null) {
+        const originName = timetable.stopNames[transitOriginIndex] ?? '';
+        originDisplayElement.textContent = t('journey.from', { name: originName });
+        originDisplayElement.style.display = 'block';
+        setStatus(
+          t('status.result', {
+            name: originName,
+            stops: transitResult.stops.length.toLocaleString(),
+            legs: transitResult.legs.length.toLocaleString(),
+            ms: lastSearchElapsedMs.toFixed(1),
+          }),
+        );
+        return;
+      }
 
+      originDisplayElement.style.display = 'none';
       setStatus(
-        t('status.result', {
-          name: originName,
-          stops: currentResult.stops.length.toLocaleString(),
-          legs: currentResult.legs.length.toLocaleString(),
+        `${t('status.loaded', {
+          stops: timetable.stopNames.length.toLocaleString(),
+          patterns: timetable.patterns.length.toLocaleString(),
+          date: timetable.referenceDate,
+        })}\n${t('status.clickHint')}`,
+      );
+      return;
+    }
+
+    if (carOriginIndex !== null && carResult !== null) {
+      originDisplayElement.textContent = t('journey.from', { name: t('origin.selectedPoint') });
+      originDisplayElement.style.display = 'block';
+      setStatus(
+        t('status.car.result', {
+          nodes: carResult.nodes.length.toLocaleString(),
+          edges: carResult.edges.length.toLocaleString(),
           ms: lastSearchElapsedMs.toFixed(1),
         }),
       );
@@ -400,42 +558,82 @@ async function main(): Promise<void> {
     }
 
     originDisplayElement.style.display = 'none';
-    setStatus(
-      `${t('status.loaded', {
-        stops: timetable.stopNames.length.toLocaleString(),
-        patterns: timetable.patterns.length.toLocaleString(),
-        date: timetable.referenceDate,
-      })}\n${t('status.clickHint')}`,
-    );
+    setStatus(t('status.clickHint'));
   }
 
   function runSearch(): void {
-    if (currentOriginIndex === null) {
+    if (currentMode === 'transit') {
+      if (transitOriginIndex === null) {
+        return;
+      }
+
+      // The redrawn layer holds none of the previous features, so a
+      // lingering reference here would style a tip that no longer exists.
+      hoveredTip = null;
+      hoverRouteSource.clear();
+      tooltipElement.style.display = 'none';
+
+      const departureSeconds = departureSecondsFromInput();
+      const budgetSeconds = Number(budgetInput.value) * 60;
+      const start = performance.now();
+      const result = findReachableStops(timetable, transitOriginIndex, departureSeconds, budgetSeconds);
+      lastSearchElapsedMs = performance.now() - start;
+      transitResult = result;
+
+      drawTransitIsochrone(timetable, result);
+      drawTransitReachability(timetable, result);
+      refreshStatus();
       return;
     }
 
-    // The redrawn layer holds none of the previous features, so a lingering
-    // reference here would style a tip that no longer exists in the source.
-    hoveredTip = null;
-    hoverRouteSource.clear();
-    tooltipElement.style.display = 'none';
+    if (carOriginIndex === null) {
+      return;
+    }
 
-    const departureSeconds = departureSecondsFromInput();
     const budgetSeconds = Number(budgetInput.value) * 60;
     const start = performance.now();
-    const result = findReachableStops(
-      timetable,
-      currentOriginIndex,
-      departureSeconds,
-      budgetSeconds,
-    );
+    const result = findReachableRoadNodes(roadNetwork, carOriginIndex, budgetSeconds);
     lastSearchElapsedMs = performance.now() - start;
-    currentResult = result;
+    carResult = result;
 
-    drawIsochrone(timetable, result);
-    drawReachability(timetable, result);
+    drawCarIsochrone(roadNetwork, result);
+    drawCarRoads(roadNetwork, result);
     refreshStatus();
   }
+
+  // --- Manual stop entry: a name typed or picked from the datalist sets the
+  // transit origin exactly as a map click would, for a reader who knows
+  // where they want to start from rather than where it is on the map. ------
+  const stopIndexByName = new Map<string, number>();
+  for (let stopIndex = 0; stopIndex < timetable.stopNames.length; stopIndex += 1) {
+    if ((timetable.patternsAtStop[stopIndex]?.length ?? 0) === 0) {
+      continue;
+    }
+    const name = timetable.stopNames[stopIndex] ?? '';
+    if (name && !stopIndexByName.has(name)) {
+      stopIndexByName.set(name, stopIndex);
+    }
+  }
+
+  const datalistFragment = document.createDocumentFragment();
+  for (const name of stopIndexByName.keys()) {
+    const option = document.createElement('option');
+    option.value = name;
+    datalistFragment.appendChild(option);
+  }
+  stopSearchDatalist.appendChild(datalistFragment);
+  console.log(`Stop search: ${stopIndexByName.size.toLocaleString()} named stops indexed.`);
+
+  stopSearchInput.addEventListener('input', () => {
+    const stopIndex = stopIndexByName.get(stopSearchInput.value.trim());
+    if (stopIndex === undefined) {
+      return;
+    }
+
+    transitOriginIndex = stopIndex;
+    view.setCenter(coordinateOf(timetable, stopIndex));
+    runSearch();
+  });
 
   refreshStatus();
   onLanguageChange(() => {
@@ -445,7 +643,9 @@ async function main(): Promise<void> {
 
   // --- Hover: lift a tip, show which station it is, and draw the one route
   // that reaches it — connections are not drawn until a tip is hovered, so
-  // the map at rest shows just the reachable area and its endpoints. -------
+  // the map at rest shows just the reachable area and its endpoints. Only
+  // meaningful in transit mode: `reachabilityLayer` holds no features while
+  // in car mode, so this is naturally a no-op there. --------------------
   const setHoveredTip = (feature: Feature | null) => {
     if (hoveredTip === feature) {
       return;
@@ -455,9 +655,9 @@ async function main(): Promise<void> {
     hoveredTip = feature;
     hoveredTip?.setStyle(hoveredTip.get(HOVER_STYLE_PROPERTY) as Style);
 
-    if (currentResult !== null) {
+    if (transitResult !== null) {
       const stopIndex = hoveredTip ? (hoveredTip.get(STOP_INDEX_PROPERTY) as number) : null;
-      drawHoverRoute(timetable, currentResult, stopIndex);
+      drawHoverRoute(timetable, transitResult, stopIndex);
     }
   };
 
@@ -483,8 +683,8 @@ async function main(): Promise<void> {
 
     const tipStopIndex = tip ? (tip.get(STOP_INDEX_PROPERTY) as number | undefined) : undefined;
     const html =
-      tip && currentResult !== null && tipStopIndex !== undefined
-        ? formatJourneyHtml(timetable, currentResult, tipStopIndex)
+      tip && transitResult !== null && tipStopIndex !== undefined
+        ? formatJourneyHtml(timetable, transitResult, tipStopIndex)
         : null;
 
     if (html) {
@@ -499,14 +699,24 @@ async function main(): Promise<void> {
 
   map.on('singleclick', (event: MapBrowserEvent) => {
     const [easting, northing] = event.coordinate;
-    const nearest = nearestUsedStopIndex(timetable, easting, northing);
 
-    if (nearest === null) {
-      setStatus(t('status.noStop'));
+    if (currentMode === 'transit') {
+      const nearest = nearestUsedStopIndex(timetable, easting, northing);
+      if (nearest === null) {
+        setStatus(t('status.noStop'));
+        return;
+      }
+      transitOriginIndex = nearest;
+      runSearch();
       return;
     }
 
-    currentOriginIndex = nearest;
+    const nearest = nearestRoadNodeIndex(roadNetwork, easting, northing);
+    if (nearest === null) {
+      setStatus(t('status.noRoad'));
+      return;
+    }
+    carOriginIndex = nearest;
     runSearch();
   });
 
@@ -516,16 +726,63 @@ async function main(): Promise<void> {
     runSearch();
   });
 
+  function applyNetworkLayerVisibility(): void {
+    reachabilityLayer.setVisible(currentMode === 'transit' && showNetworkInput.checked);
+    hoverRouteLayer.setVisible(currentMode === 'transit' && showNetworkInput.checked);
+    carRoadLayer.setVisible(currentMode === 'car' && showNetworkInput.checked);
+  }
+
   isochroneLayer.setVisible(showIsochroneInput.checked);
-  reachabilityLayer.setVisible(showNetworkInput.checked);
-  hoverRouteLayer.setVisible(showNetworkInput.checked);
+  applyNetworkLayerVisibility();
   showIsochroneInput.addEventListener('change', () => {
     isochroneLayer.setVisible(showIsochroneInput.checked);
   });
-  showNetworkInput.addEventListener('change', () => {
-    reachabilityLayer.setVisible(showNetworkInput.checked);
-    hoverRouteLayer.setVisible(showNetworkInput.checked);
-  });
+  showNetworkInput.addEventListener('change', applyNetworkLayerVisibility);
+
+  // --- Mode switch: like Google Maps' travel-mode tabs, each mode keeps its
+  // own last result, so flipping back and forth redraws rather than re-runs
+  // a search. ---------------------------------------------------------------
+  function setMode(mode: Mode): void {
+    if (currentMode === mode) {
+      return;
+    }
+
+    currentMode = mode;
+    modeTransitButton.setAttribute('aria-pressed', String(mode === 'transit'));
+    modeCarButton.setAttribute('aria-pressed', String(mode === 'car'));
+    stopSearchRowElement.style.display = mode === 'transit' ? 'block' : 'none';
+    departureRowElement.style.display = mode === 'transit' ? 'block' : 'none';
+    legendTransitElement.style.display = mode === 'transit' ? 'grid' : 'none';
+    legendCarElement.style.display = mode === 'car' ? 'grid' : 'none';
+
+    hoveredTip = null;
+    tooltipElement.style.display = 'none';
+    applyNetworkLayerVisibility();
+
+    if (mode === 'transit') {
+      if (transitResult !== null) {
+        drawTransitIsochrone(timetable, transitResult);
+        drawTransitReachability(timetable, transitResult);
+      } else {
+        isochroneSource.clear();
+        reachabilitySource.clear();
+      }
+    } else {
+      if (carResult !== null) {
+        drawCarIsochrone(roadNetwork, carResult);
+        drawCarRoads(roadNetwork, carResult);
+      } else {
+        isochroneSource.clear();
+        carRoadSource.clear();
+      }
+    }
+
+    applyStaticText();
+    refreshStatus();
+  }
+
+  modeTransitButton.addEventListener('click', () => setMode('transit'));
+  modeCarButton.addEventListener('click', () => setMode('car'));
 
   languageSelect.value = getLanguage();
   languageSelect.addEventListener('change', () => {

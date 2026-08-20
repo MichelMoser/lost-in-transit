@@ -10,5 +10,5 @@
     "noEmit": true
   },
   "include": ["src", "../src"],
-  "exclude": ["../src/raptor.test.ts"]
+  "exclude": ["../src/raptor.test.ts", "../src/carRouter.test.ts"]
 }

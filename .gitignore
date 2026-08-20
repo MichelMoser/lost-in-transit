@@ -4,6 +4,11 @@
 data/gtfs_switzerland.zip
 data/extracted/
 
+# Raw Overpass (OpenStreetMap) export the road-network build reads from —
+# see build-road-network.mjs's header comment for the query that produces
+# it. ~20MB, regenerable, not needed once data/output/road-network/ exists.
+data/osm-roads-switzerland.json
+
 # build-snapshot.mjs's output is duplicated verbatim under viewer/public/data/
 # (that copy is what's committed and what GitHub Pages serves) — no need to
 # commit it twice. Regenerate with `npm run build:snapshot`.
