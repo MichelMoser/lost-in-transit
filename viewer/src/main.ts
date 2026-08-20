@@ -6,6 +6,7 @@ import View from 'ol/View.js';
 import Feature from 'ol/Feature.js';
 import Point from 'ol/geom/Point.js';
 import LineString from 'ol/geom/LineString.js';
+import MultiLineString from 'ol/geom/MultiLineString.js';
 import Polygon from 'ol/geom/Polygon.js';
 import VectorLayer from 'ol/layer/Vector.js';
 import VectorSource from 'ol/source/Vector.js';
@@ -180,7 +181,7 @@ function isochroneFillStyle(elapsedSeconds: number, budgetSeconds: number): Styl
 const reachabilitySource = new VectorSource();
 const reachabilityLayer = new VectorLayer({ source: reachabilitySource, zIndex: 10 });
 
-/** The single transit route drawn to whichever tip is currently hovered — see `drawHoverRoute`. */
+/** The single route drawn to whichever tip is currently hovered, in either mode — see `drawHoverRoute` / `drawCarHoverRoute`. */
 const hoverRouteSource = new VectorSource();
 const hoverRouteLayer = new VectorLayer({ source: hoverRouteSource, zIndex: 8 });
 
@@ -232,25 +233,36 @@ const CAR_ROAD_STYLE = new Style({
  * where no further edge continues outward within budget — an outer ring
  * with a solid black centre dot, distinct from both the transit tips
  * (coloured by elapsed time) and the origin (a plain solid dot) so all
- * three read as different things at a glance.
+ * three read as different things at a glance. The hovered variant is
+ * simply larger, same as the transit tips' own hover state.
  */
-const CAR_TIP_STYLE = [
-  new Style({
-    image: new CircleStyle({
-      radius: 6,
-      fill: new Fill({ color: 'rgba(255, 255, 255, 0.9)' }),
-      stroke: new Stroke({ color: '#2563eb', width: 1.5 }),
+function carTipStyle(hovered: boolean): Style[] {
+  return [
+    new Style({
+      image: new CircleStyle({
+        radius: hovered ? 9 : 6,
+        fill: new Fill({ color: 'rgba(255, 255, 255, 0.9)' }),
+        stroke: new Stroke({ color: '#2563eb', width: hovered ? 2.5 : 1.5 }),
+      }),
+      zIndex: 4,
     }),
-    zIndex: 4,
-  }),
-  new Style({
-    image: new CircleStyle({
-      radius: 2.5,
-      fill: new Fill({ color: '#111111' }),
+    new Style({
+      image: new CircleStyle({
+        radius: hovered ? 3.5 : 2.5,
+        fill: new Fill({ color: '#111111' }),
+      }),
+      zIndex: 5,
     }),
-    zIndex: 5,
-  }),
-];
+  ];
+}
+const CAR_TIP_STYLE = carTipStyle(false);
+const CAR_TIP_HOVER_STYLE = carTipStyle(true);
+
+/** The highlighted route to a hovered car tip — solid and heavier than the always-visible network underneath it. */
+const CAR_HOVER_ROUTE_STYLE = new Style({
+  stroke: new Stroke({ color: '#1d4ed8', width: 4 }),
+  zIndex: 7,
+});
 
 const ORIGIN_STYLE = new Style({
   image: new CircleStyle({
@@ -283,6 +295,7 @@ function tipStyle(elapsedSeconds: number, budgetSeconds: number, hovered: boolea
 const ROLE_PROPERTY = 'role';
 const STOP_NAME_PROPERTY = 'stopName';
 const STOP_INDEX_PROPERTY = 'stopIndex';
+const NODE_INDEX_PROPERTY = 'nodeIndex';
 const NORMAL_STYLE_PROPERTY = 'normalStyle';
 const HOVER_STYLE_PROPERTY = 'hoverStyle';
 
@@ -304,10 +317,42 @@ function findTipStops(result: TransitReachability): TransitReachability['stops']
   return result.stops.filter((stop) => !stopsWithOutgoingLeg.has(stop.stopIndex));
 }
 
-/** Same idea as `findTipStops`, for the road network's own reached nodes. */
-function findTipRoadNodes(result: CarReachability): CarReachability['nodes'] {
-  const nodesWithOutgoingEdge = new Set(result.edges.map((edge) => edge.fromNodeIndex));
-  return result.nodes.filter((node) => !nodesWithOutgoingEdge.has(node.nodeIndex));
+/**
+ * Same idea as `findTipStops`, for the road network's own reached nodes —
+ * but a full street network's dead ends are numerous enough (tens of
+ * thousands at a typical budget: every cul-de-sac and short residential
+ * spur is its own tip) that showing every one would be both visually
+ * overwhelming and slow to render and hit-test. Keeping only the
+ * latest-arriving tip per grid cell caps the marker count at the network's
+ * own geographic footprint rather than its raw dead-end count.
+ */
+const CAR_TIP_GRID_METERS = 400;
+
+function findTipRoadNodes(
+  network: RoadNetwork,
+  result: CarReachability,
+): CarReachability['nodes'] {
+  const hasOutgoingEdge = new Uint8Array(network.nodeEastings.length);
+  for (const edge of result.edges) {
+    hasOutgoingEdge[edge.fromNodeIndex] = 1;
+  }
+
+  const bestByCell = new Map<string, CarReachability['nodes'][number]>();
+  for (const node of result.nodes) {
+    if (hasOutgoingEdge[node.nodeIndex]) {
+      continue;
+    }
+
+    const easting = network.nodeEastings[node.nodeIndex] ?? 0;
+    const northing = network.nodeNorthings[node.nodeIndex] ?? 0;
+    const key = `${Math.floor(easting / CAR_TIP_GRID_METERS)}:${Math.floor(northing / CAR_TIP_GRID_METERS)}`;
+    const existing = bestByCell.get(key);
+    if (!existing || node.arrivalSeconds > existing.arrivalSeconds) {
+      bestByCell.set(key, node);
+    }
+  }
+
+  return [...bestByCell.values()];
 }
 
 function drawTransitIsochrone(timetable: Timetable, result: TransitReachability): void {
@@ -387,34 +432,72 @@ function drawHoverRoute(
 }
 
 /**
+ * Distinct `Feature`s the reached road network is split across — see
+ * `drawCarRoads`. At national street-network scale a search can reach
+ * well over a million edges (every residential cul-de-sac counts); one OL
+ * `Feature` per edge was measured freezing the tab for tens of seconds.
+ * Splitting into a small, fixed number of `MultiLineString`s instead keeps
+ * the feature count — and so the render cost — roughly constant regardless
+ * of how much was reached, the same fix the isochrone hex splat needed at
+ * this project's last order-of-magnitude jump.
+ */
+const CAR_ROAD_BATCH_COUNT = 24;
+
+/**
  * Draws the reached road network as thin lines that follow the actual
  * streets, plus a ring-and-dot marker at each branch's furthest point and
  * the usual origin marker — a more street-literal picture than a hex fill,
- * per the project owner's own request. Every edge is its own stroke, drawn
- * with the single shared `CAR_ROAD_STYLE` — where edges coincide (a
- * two-way road's opposite-direction pair, or several short segments
- * bunched at an interchange), each is still a separate canvas paint
- * operation, so their alpha composites and the road reads visibly thicker
- * there without any density computed by hand.
+ * per the project owner's own request. Edges are split across
+ * `CAR_ROAD_BATCH_COUNT` batches rather than drawn individually (see
+ * above); within a batch, coincident segments (a two-way road's
+ * opposite-direction pair, several short segments bunched at an
+ * interchange) still won't double up since they share one path, but two
+ * segments landing in *different* batches do compose their alpha on the
+ * canvas, so dense coverage still reads visibly thicker without any
+ * density computed by hand.
  */
+/**
+ * The result last drawn into `carRoadSource` — rebuilding the batches below
+ * is itself a couple of seconds' work at national scale (see
+ * `CAR_ROAD_BATCH_COUNT`), so switching back to car mode after visiting
+ * transit mode should redraw the *layer* (cheap — the features are still
+ * there) rather than redo that work for a result that hasn't changed.
+ */
+let lastDrawnCarResult: CarReachability | null = null;
+
 function drawCarRoads(network: RoadNetwork, result: CarReachability): void {
+  if (result === lastDrawnCarResult) {
+    return;
+  }
+  lastDrawnCarResult = result;
+
   carRoadSource.clear();
 
-  for (const edge of result.edges) {
-    const feature = new Feature({
-      geometry: new LineString([
-        roadCoordinateOf(network, edge.fromNodeIndex),
-        roadCoordinateOf(network, edge.toNodeIndex),
-      ]),
-    });
+  const batches: [number, number][][][] = Array.from({ length: CAR_ROAD_BATCH_COUNT }, () => []);
+  result.edges.forEach((edge, index) => {
+    batches[index % CAR_ROAD_BATCH_COUNT]?.push([
+      roadCoordinateOf(network, edge.fromNodeIndex),
+      roadCoordinateOf(network, edge.toNodeIndex),
+    ]);
+  });
+
+  for (const lines of batches) {
+    if (lines.length === 0) {
+      continue;
+    }
+    const feature = new Feature({ geometry: new MultiLineString(lines) });
     feature.setStyle(CAR_ROAD_STYLE);
     carRoadSource.addFeature(feature);
   }
 
-  for (const node of findTipRoadNodes(result)) {
+  for (const node of findTipRoadNodes(network, result)) {
     const tipFeature = new Feature({
       geometry: new Point(roadCoordinateOf(network, node.nodeIndex)),
     });
+    tipFeature.set(ROLE_PROPERTY, 'tip');
+    tipFeature.set(NODE_INDEX_PROPERTY, node.nodeIndex);
+    tipFeature.set(NORMAL_STYLE_PROPERTY, CAR_TIP_STYLE);
+    tipFeature.set(HOVER_STYLE_PROPERTY, CAR_TIP_HOVER_STYLE);
     tipFeature.setStyle(CAR_TIP_STYLE);
     carRoadSource.addFeature(tipFeature);
   }
@@ -424,6 +507,35 @@ function drawCarRoads(network: RoadNetwork, result: CarReachability): void {
   });
   originFeature.setStyle(ORIGIN_STYLE);
   carRoadSource.addFeature(originFeature);
+}
+
+/** Draws the point-to-point route to one hovered car tip, or clears it when `nodeIndex` is `null`. */
+function drawCarHoverRoute(
+  network: RoadNetwork,
+  result: CarReachability,
+  nodeIndex: number | null,
+): void {
+  hoverRouteSource.clear();
+
+  if (nodeIndex === null) {
+    return;
+  }
+
+  const route = result.getRouteTo(nodeIndex);
+  if (!route) {
+    return;
+  }
+
+  for (const segment of route) {
+    const feature = new Feature({
+      geometry: new LineString([
+        roadCoordinateOf(network, segment.fromNodeIndex),
+        roadCoordinateOf(network, segment.toNodeIndex),
+      ]),
+    });
+    feature.setStyle(CAR_HOVER_ROUTE_STYLE);
+    hoverRouteSource.addFeature(feature);
+  }
 }
 
 // --- Nearest-point lookups: brute force, fine for one click at a time. ------
@@ -488,35 +600,54 @@ function departureSecondsFromInput(): number {
   return (hours ?? 8) * 3600 + (minutes ?? 0) * 60;
 }
 
+/**
+ * Fetches and decodes the road network — a national, every-street graph, so
+ * around 120MB even packed as CSR typed arrays. Loaded lazily, only once a
+ * reader actually switches to car mode, rather than upfront alongside the
+ * ~30MB transit snapshot: making every visitor wait on 150MB before the
+ * page is interactive at all, for data most searches (transit ones) never
+ * touch, would be a bad trade for the one-time cost of a short pause the
+ * first time someone tries driving mode.
+ */
+function fetchRoadNetwork(): Promise<RoadNetwork> {
+  return Promise.all([
+    fetch(`${import.meta.env.BASE_URL}data/road-network/nodes.bin`).then((response) =>
+      response.arrayBuffer(),
+    ),
+    fetch(`${import.meta.env.BASE_URL}data/road-network/edges.bin`).then((response) =>
+      response.arrayBuffer(),
+    ),
+    fetch(`${import.meta.env.BASE_URL}data/road-network/edge-offsets.bin`).then((response) =>
+      response.arrayBuffer(),
+    ),
+    fetch(`${import.meta.env.BASE_URL}data/road-network/origin-eligible.bin`).then((response) =>
+      response.arrayBuffer(),
+    ),
+  ]).then(([nodesBuffer, edgesBuffer, edgeOffsetsBuffer, originEligibleBuffer]) =>
+    loadRoadNetwork(nodesBuffer, edgesBuffer, edgeOffsetsBuffer, originEligibleBuffer),
+  );
+}
+
 async function main(): Promise<void> {
   applyStaticText();
   setStatus(t('status.loading'));
 
-  const [manifest, stops, stopTimesBuffer, roadNodes, roadEdgesBuffer, originEligibleBuffer] =
-    await Promise.all([
-      // Root-relative, not absolute: GitHub Pages serves this as a project
-      // site under /<repo>/, so an absolute `/data/...` would miss the data
-      // this same deploy carries and instead ask the domain's real root for
-      // it. `BASE_URL` is Vite's own build-time answer to "where am I served
-      // from", already trailing-slashed.
-      fetch(`${import.meta.env.BASE_URL}data/manifest.json`).then((response) => response.json()),
-      fetch(`${import.meta.env.BASE_URL}data/stops.json`).then((response) => response.json()),
-      fetch(`${import.meta.env.BASE_URL}data/stop-times.bin`).then((response) =>
-        response.arrayBuffer(),
-      ),
-      fetch(`${import.meta.env.BASE_URL}data/road-network/nodes.json`).then((response) =>
-        response.json(),
-      ),
-      fetch(`${import.meta.env.BASE_URL}data/road-network/edges.bin`).then((response) =>
-        response.arrayBuffer(),
-      ),
-      fetch(`${import.meta.env.BASE_URL}data/road-network/origin-eligible.bin`).then((response) =>
-        response.arrayBuffer(),
-      ),
-    ]);
+  // Root-relative, not absolute: GitHub Pages serves this as a project site
+  // under /<repo>/, so an absolute `/data/...` would miss the data this
+  // same deploy carries and instead ask the domain's real root for it.
+  // `BASE_URL` is Vite's own build-time answer to "where am I served
+  // from", already trailing-slashed.
+  const [manifest, stops, stopTimesBuffer] = await Promise.all([
+    fetch(`${import.meta.env.BASE_URL}data/manifest.json`).then((response) => response.json()),
+    fetch(`${import.meta.env.BASE_URL}data/stops.json`).then((response) => response.json()),
+    fetch(`${import.meta.env.BASE_URL}data/stop-times.bin`).then((response) =>
+      response.arrayBuffer(),
+    ),
+  ]);
 
   const timetable = loadTimetable(manifest, stops, stopTimesBuffer);
-  const roadNetwork = loadRoadNetwork(roadNodes, roadEdgesBuffer, originEligibleBuffer);
+  let roadNetwork: RoadNetwork | null = null;
+  let roadNetworkLoadPromise: Promise<RoadNetwork> | null = null;
 
   const basemapLayer = createBasemapLayer(lv95Projection);
   const view = new View({
@@ -614,9 +745,12 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (carOriginIndex === null) {
+    if (carOriginIndex === null || roadNetwork === null) {
       return;
     }
+
+    hoveredTip = null;
+    hoverRouteSource.clear();
 
     const budgetSeconds = Number(budgetInput.value) * 60;
     const start = performance.now();
@@ -668,23 +802,27 @@ async function main(): Promise<void> {
     refreshStatus();
   });
 
-  // --- Hover: lift a tip, show which station it is, and draw the one route
-  // that reaches it — connections are not drawn until a tip is hovered, so
-  // the map at rest shows just the reachable area and its endpoints. Only
-  // meaningful in transit mode: `reachabilityLayer` holds no features while
-  // in car mode, so this is naturally a no-op there. --------------------
+  // --- Hover: lift a tip and draw the one route that reaches it —
+  // connections are not drawn until a tip is hovered, so the map at rest
+  // shows just the reachable area and its endpoints. Works the same way in
+  // both modes; only the itinerary tooltip is transit-only (road junctions
+  // have no name to show, and "which streets" is exactly what the
+  // highlighted route already draws). ---------------------------------
   const setHoveredTip = (feature: Feature | null) => {
     if (hoveredTip === feature) {
       return;
     }
 
-    hoveredTip?.setStyle(hoveredTip.get(NORMAL_STYLE_PROPERTY) as Style);
+    hoveredTip?.setStyle(hoveredTip.get(NORMAL_STYLE_PROPERTY) as Style | Style[]);
     hoveredTip = feature;
-    hoveredTip?.setStyle(hoveredTip.get(HOVER_STYLE_PROPERTY) as Style);
+    hoveredTip?.setStyle(hoveredTip.get(HOVER_STYLE_PROPERTY) as Style | Style[]);
 
-    if (transitResult !== null) {
+    if (currentMode === 'transit' && transitResult !== null) {
       const stopIndex = hoveredTip ? (hoveredTip.get(STOP_INDEX_PROPERTY) as number) : null;
       drawHoverRoute(timetable, transitResult, stopIndex);
+    } else if (currentMode === 'car' && carResult !== null && roadNetwork !== null) {
+      const nodeIndex = hoveredTip ? (hoveredTip.get(NODE_INDEX_PROPERTY) as number) : null;
+      drawCarHoverRoute(roadNetwork, carResult, nodeIndex);
     }
   };
 
@@ -693,12 +831,13 @@ async function main(): Promise<void> {
       return;
     }
 
+    const hoverLayer = currentMode === 'transit' ? reachabilityLayer : carRoadLayer;
     const feature = map.forEachFeatureAtPixel(
       event.pixel,
       (candidate) => candidate,
       {
         hitTolerance: 6,
-        layerFilter: (layer) => layer === reachabilityLayer,
+        layerFilter: (layer) => layer === hoverLayer,
       },
     );
 
@@ -710,7 +849,7 @@ async function main(): Promise<void> {
 
     const tipStopIndex = tip ? (tip.get(STOP_INDEX_PROPERTY) as number | undefined) : undefined;
     const html =
-      tip && transitResult !== null && tipStopIndex !== undefined
+      currentMode === 'transit' && tip && transitResult !== null && tipStopIndex !== undefined
         ? formatJourneyHtml(timetable, transitResult, tipStopIndex)
         : null;
 
@@ -738,6 +877,10 @@ async function main(): Promise<void> {
       return;
     }
 
+    if (roadNetwork === null) {
+      return; // Still loading — see setMode; the map is effectively inert until it resolves.
+    }
+
     const nearest = nearestRoadNodeIndex(roadNetwork, easting, northing);
     if (nearest === null) {
       setStatus(t('status.noRoad'));
@@ -755,7 +898,7 @@ async function main(): Promise<void> {
 
   function applyNetworkLayerVisibility(): void {
     reachabilityLayer.setVisible(currentMode === 'transit' && showNetworkInput.checked);
-    hoverRouteLayer.setVisible(currentMode === 'transit' && showNetworkInput.checked);
+    hoverRouteLayer.setVisible(showNetworkInput.checked);
     carRoadLayer.setVisible(currentMode === 'car' && showNetworkInput.checked);
   }
 
@@ -776,9 +919,24 @@ async function main(): Promise<void> {
   // --- Mode switch: like Google Maps' travel-mode tabs, each mode keeps its
   // own last result, so flipping back and forth redraws rather than re-runs
   // a search. ---------------------------------------------------------------
-  function setMode(mode: Mode): void {
+  async function setMode(mode: Mode): Promise<void> {
     if (currentMode === mode) {
       return;
+    }
+
+    if (mode === 'car' && roadNetwork === null) {
+      // First switch to car mode: fetch the ~120MB road network before
+      // finishing the switch, rather than leaving the map clickable with
+      // nothing loaded to search against yet.
+      modeTransitButton.disabled = true;
+      modeCarButton.disabled = true;
+      setStatus(t('status.loadingRoadNetwork'));
+
+      roadNetworkLoadPromise ??= fetchRoadNetwork();
+      roadNetwork = await roadNetworkLoadPromise;
+
+      modeTransitButton.disabled = false;
+      modeCarButton.disabled = false;
     }
 
     currentMode = mode;
@@ -790,6 +948,7 @@ async function main(): Promise<void> {
     legendCarElement.style.display = mode === 'car' ? 'grid' : 'none';
 
     hoveredTip = null;
+    hoverRouteSource.clear();
     tooltipElement.style.display = 'none';
     applyNetworkLayerVisibility();
     applyIsochroneVisibility();
@@ -804,7 +963,7 @@ async function main(): Promise<void> {
       }
     } else {
       isochroneSource.clear();
-      if (carResult !== null) {
+      if (carResult !== null && roadNetwork !== null) {
         drawCarRoads(roadNetwork, carResult);
       } else {
         carRoadSource.clear();
@@ -815,8 +974,8 @@ async function main(): Promise<void> {
     refreshStatus();
   }
 
-  modeTransitButton.addEventListener('click', () => setMode('transit'));
-  modeCarButton.addEventListener('click', () => setMode('car'));
+  modeTransitButton.addEventListener('click', () => void setMode('transit'));
+  modeCarButton.addEventListener('click', () => void setMode('car'));
 
   languageSelect.value = getLanguage();
   languageSelect.addEventListener('change', () => {

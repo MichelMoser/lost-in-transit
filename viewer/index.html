@@ -37,6 +37,7 @@
       }
       #modeSwitch button + button { border-left: 1px solid #ccc; }
       #modeSwitch button[aria-pressed="true"] { background: #111; color: #fff; }
+      #modeSwitch button:disabled { opacity: 0.5; cursor: wait; }
       #status { margin-top: 8px; color: #444; white-space: pre-line; }
       #legendTransit, #legendCar { margin-top: 10px; display: grid; gap: 3px; }
       #legendTransit div, #legendCar div { display: flex; align-items: center; gap: 6px; }
@@ -138,10 +139,10 @@
         <div><span class="swatch" style="background:#999;border-top:1px dashed #999;height:0"></span><span id="legendWalking">Walking transfer</span></div>
       </div>
       <div id="legendCar" style="display:none;">
-        <div><span class="swatch" style="background:rgba(37,99,235,0.6)"></span><span id="legendMotorway">Motorway / expressway</span></div>
+        <div><span class="swatch" style="background:rgba(37,99,235,0.6)"></span><span id="legendMotorway">Street network</span></div>
         <div><span class="swatch-tip"><span class="swatch-tip-dot"></span></span><span id="legendCarTip">Furthest reachable point</span></div>
         <div id="legendCarNote" style="margin-top:4px; font-size:11px; color:#777; font-weight:400;">
-          Only the motorway/expressway network is routed.
+          Routes over Switzerland's public street network.
         </div>
       </div>
 

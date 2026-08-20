@@ -2,11 +2,11 @@
  * Business context: answers "everywhere reachable by car from one road
  * junction, within this time budget" — the driving counterpart of
  * `raptor.ts`. There is no timetable to round through here, so a plain
- * Dijkstra search over the motorway/trunk graph is the right tool: one
- * priority queue, expanding the closest unsettled node each step, stopping
- * once nothing left in the queue can still beat the budget.
+ * Dijkstra search over the street graph is the right tool: one priority
+ * queue, expanding the closest unsettled node each step, stopping once
+ * nothing left in the queue can still beat the budget.
  */
-import type { RoadNetwork } from './roadNetwork';
+import { edgesFrom, type RoadNetwork } from './roadNetwork';
 
 /** One road junction the search reached, and when. */
 export interface ReachableRoadNode {
@@ -21,12 +21,30 @@ export interface ReachableRoadEdge {
   toNodeIndex: number;
 }
 
+/** One step of a full point-to-point route, in travel order — see `getRouteTo`. */
+export interface RoadRouteSegment {
+  fromNodeIndex: number;
+  toNodeIndex: number;
+  travelSeconds: number;
+}
+
 /** Result of one driving reachability search. */
 export interface CarReachability {
   originNodeIndex: number;
   budgetSeconds: number;
   nodes: ReachableRoadNode[];
   edges: ReachableRoadEdge[];
+  /**
+   * The full sequence of road segments from the origin to one reached node,
+   * in travel order — what a reader hovering a destination actually wants,
+   * as opposed to `edges`, which is the whole shortest-path tree drawn on
+   * the map at once.
+   *
+   * @param nodeIndex - A node from this same search's `nodes` (or the
+   *   origin itself, which answers with an empty route).
+   * @returns The route, or `null` if this search never reached that node.
+   */
+  getRouteTo: (nodeIndex: number) => RoadRouteSegment[] | null;
 }
 
 /** Binary min-heap keyed by arrival time — the priority queue Dijkstra pops from. */
@@ -135,16 +153,19 @@ export function findReachableRoadNodes(
       continue;
     }
 
-    for (const edge of network.edgesFromNode[nodeIndex] ?? []) {
-      const candidate = arrivalSeconds + edge.travelSeconds;
+    const { start, end } = edgesFrom(network, nodeIndex);
+    for (let edgeIndex = start; edgeIndex < end; edgeIndex += 1) {
+      const toNodeIndex = network.edgeToNode[edgeIndex] as number;
+      const travelSeconds = network.edgeTravelSeconds[edgeIndex] as number;
+      const candidate = arrivalSeconds + travelSeconds;
       if (candidate > budgetSeconds) {
         continue;
       }
 
-      if (candidate < (bestArrival[edge.toNodeIndex] ?? Infinity)) {
-        bestArrival[edge.toNodeIndex] = candidate;
-        cameFrom[edge.toNodeIndex] = nodeIndex;
-        heap.push(edge.toNodeIndex, candidate);
+      if (candidate < (bestArrival[toNodeIndex] ?? Infinity)) {
+        bestArrival[toNodeIndex] = candidate;
+        cameFrom[toNodeIndex] = nodeIndex;
+        heap.push(toNodeIndex, candidate);
       }
     }
   }
@@ -166,5 +187,36 @@ export function findReachableRoadNodes(
     }
   }
 
-  return { originNodeIndex, budgetSeconds, nodes, edges };
+  const getRouteTo = (nodeIndex: number): RoadRouteSegment[] | null => {
+    if ((bestArrival[nodeIndex] ?? Infinity) === Infinity) {
+      return null;
+    }
+
+    const segments: RoadRouteSegment[] = [];
+    const visited = new Set<number>();
+    let current = nodeIndex;
+
+    while (current !== originNodeIndex) {
+      if (visited.has(current)) {
+        return null; // Defensive: a cycle here would mean a bug elsewhere, not a real route.
+      }
+      visited.add(current);
+
+      const fromNodeIndex = cameFrom[current] ?? -1;
+      if (fromNodeIndex < 0) {
+        return null;
+      }
+
+      segments.push({
+        fromNodeIndex,
+        toNodeIndex: current,
+        travelSeconds: (bestArrival[current] ?? 0) - (bestArrival[fromNodeIndex] ?? 0),
+      });
+      current = fromNodeIndex;
+    }
+
+    return segments.reverse();
+  };
+
+  return { originNodeIndex, budgetSeconds, nodes, edges, getRouteTo };
 }

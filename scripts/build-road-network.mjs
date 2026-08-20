@@ -1,28 +1,30 @@
 /**
- * Business context: turns Switzerland's motorway + trunk road network (the
- * "autoroute"/"Autobahn" and "Autostrasse"/expressway tiers, fetched from
- * OpenStreetMap via Overpass) into a compact directed graph a browser can
- * run Dijkstra over — the driving counterpart of build-snapshot.mjs's
- * transit patterns.
+ * Business context: turns every drivable OSM street in Switzerland (fetched
+ * via Overpass) into a compact directed graph a browser can run Dijkstra
+ * over — the driving counterpart of build-snapshot.mjs's transit patterns.
  *
- * Scope is deliberately limited to the two highest road classes rather than
- * every street: a full national street graph is millions of edges, too
- * large for a client-side snapshot with no backend, and "using autoroutes"
- * was the brief. The isochrone this produces reads as "how far the
- * motorway/expressway network reaches," widened by a flat local-road buffer
- * around each reached junction (see viewer/src/isochrone.ts) rather than a
- * house-to-house result — a documented approximation, not a bug.
+ * "Every street" means every OSM `highway` class down through residential
+ * and living_street — not `service` (driveways, parking aisles), `track`,
+ * or non-motorised classes. That is still ~408,000 ways nationally (22x
+ * the original motorway/trunk-only scope), around half a gigabyte of raw
+ * Overpass JSON, so this script needs a large heap:
  *
- * Usage: `node build-road-network.mjs` — reads the cached Overpass export at
- * data/osm-roads-switzerland.json. To refresh that export:
+ *   node --max-old-space-size=8192 build-road-network.mjs
+ *
+ * Usage: reads the cached Overpass export at data/osm-roads-switzerland.json
+ * (~500MB, gitignored). To refresh that export:
  *
  *   curl -s --data-urlencode "data@query.txt" \
  *     https://overpass-api.de/api/interpreter -o data/osm-roads-switzerland.json
  *
  * where query.txt is:
- *   [out:json][timeout:180];
+ *   [out:json][timeout:600][maxsize:2000000000];
  *   area["ISO3166-1"="CH"][admin_level=2]->.ch;
- *   (way["highway"~"^(motorway|motorway_link|trunk|trunk_link)$"](area.ch););
+ *   (
+ *     way["highway"~"^(motorway|motorway_link|trunk|trunk_link|primary|
+ *       primary_link|secondary|secondary_link|tertiary|tertiary_link|
+ *       unclassified|residential|living_street)$"](area.ch);
+ *   );
  *   out body;
  *   >;
  *   out skel qt;
@@ -73,11 +75,23 @@ function indexOf(osmNodeId) {
 }
 
 // --- Speed per class, legal-limit approximation (no traffic modelling) -----
+// Defaults for unsigned classes are Switzerland's own statutory limits
+// where OSM's own wiki documents one (50 km/h in town, 80 km/h out of
+// town); classes with no single statutory value get a conservative estimate.
 const DEFAULT_SPEED_KMH = {
   motorway: 120,
   motorway_link: 40,
   trunk: 80,
   trunk_link: 50,
+  primary: 80,
+  primary_link: 40,
+  secondary: 80,
+  secondary_link: 40,
+  tertiary: 80,
+  tertiary_link: 40,
+  unclassified: 80,
+  residential: 50,
+  living_street: 20,
 };
 
 function speedKmhFor(tags) {
@@ -343,25 +357,59 @@ console.log(
   `(${((100 * originEligibleCount) / filteredEastings.length).toFixed(1)}%)`,
 );
 
-// --- Serialize: binary edge list, JSON node coordinates ---------------------
+// --- Serialize as CSR (compressed sparse row), all typed arrays ------------
+/**
+ * At national-street scale (4.1M nodes, 8.1M edges) an array-of-objects
+ * adjacency list — the original motorway/trunk-only shape — would mean
+ * millions of small JS objects and array shells in the browser, likely
+ * 600MB+ of heap for the graph alone. Grouping edges by their `from` node
+ * (a stable sort) lets the "from" field itself be dropped entirely: the
+ * offset table alone says where each node's own edges start and end. The
+ * whole graph then lives in four flat typed arrays — no per-edge object,
+ * no per-node array shell — which is both far smaller on disk and far
+ * cheaper for `carRouter.ts`'s Dijkstra to walk.
+ */
 mkdirSync(OUTPUT_DIR, { recursive: true });
 
-const BYTES_PER_EDGE = 12; // uint32 from, uint32 to, float32 travelSeconds
-const edgeBuffer = new ArrayBuffer(filteredEdgeFrom.length * BYTES_PER_EDGE);
-const edgeView = new DataView(edgeBuffer);
-for (let index = 0; index < filteredEdgeFrom.length; index += 1) {
-  const byteOffset = index * BYTES_PER_EDGE;
-  edgeView.setUint32(byteOffset, filteredEdgeFrom[index]);
-  edgeView.setUint32(byteOffset + 4, filteredEdgeTo[index]);
-  edgeView.setFloat32(byteOffset + 8, filteredEdgeSeconds[index]);
+const edgeOrder = Array.from({ length: filteredEdgeFrom.length }, (_unused, index) => index);
+edgeOrder.sort((a, b) => filteredEdgeFrom[a] - filteredEdgeFrom[b]);
+
+const edgeOffset = new Uint32Array(filteredEastings.length + 1);
+const edgeToNode = new Uint32Array(filteredEdgeFrom.length);
+const edgeSecondsSorted = new Float32Array(filteredEdgeFrom.length);
+for (let sortedIndex = 0; sortedIndex < edgeOrder.length; sortedIndex += 1) {
+  const originalIndex = edgeOrder[sortedIndex];
+  edgeToNode[sortedIndex] = filteredEdgeTo[originalIndex];
+  edgeSecondsSorted[sortedIndex] = filteredEdgeSeconds[originalIndex];
+  edgeOffset[filteredEdgeFrom[originalIndex] + 1] += 1;
+}
+for (let nodeIndex = 0; nodeIndex < filteredEastings.length; nodeIndex += 1) {
+  edgeOffset[nodeIndex + 1] += edgeOffset[nodeIndex];
 }
 
-writeFileSync(resolve(OUTPUT_DIR, 'edges.bin'), Buffer.from(edgeBuffer));
-writeFileSync(resolve(OUTPUT_DIR, 'origin-eligible.bin'), Buffer.from(originEligible.buffer));
-writeFileSync(
-  resolve(OUTPUT_DIR, 'nodes.json'),
-  JSON.stringify({ eastings: filteredEastings, northings: filteredNorthings }),
-);
+const nodeBuffer = new ArrayBuffer(filteredEastings.length * 8);
+const nodeView = new DataView(nodeBuffer);
+for (let nodeIndex = 0; nodeIndex < filteredEastings.length; nodeIndex += 1) {
+  nodeView.setInt32(nodeIndex * 8, filteredEastings[nodeIndex]);
+  nodeView.setInt32(nodeIndex * 8 + 4, filteredNorthings[nodeIndex]);
+}
 
-console.log('nodes kept:', filteredEastings.length, '  edges.bin bytes:', edgeBuffer.byteLength);
+const edgeBuffer = new ArrayBuffer(edgeToNode.length * 8);
+const edgeView = new DataView(edgeBuffer);
+for (let index = 0; index < edgeToNode.length; index += 1) {
+  edgeView.setUint32(index * 8, edgeToNode[index]);
+  edgeView.setFloat32(index * 8 + 4, edgeSecondsSorted[index]);
+}
+
+writeFileSync(resolve(OUTPUT_DIR, 'nodes.bin'), Buffer.from(nodeBuffer));
+writeFileSync(resolve(OUTPUT_DIR, 'edges.bin'), Buffer.from(edgeBuffer));
+writeFileSync(resolve(OUTPUT_DIR, 'edge-offsets.bin'), Buffer.from(edgeOffset.buffer));
+writeFileSync(resolve(OUTPUT_DIR, 'origin-eligible.bin'), Buffer.from(originEligible.buffer));
+
+console.log(
+  'nodes kept:', filteredEastings.length,
+  '  nodes.bin bytes:', nodeBuffer.byteLength,
+  '  edges.bin bytes:', edgeBuffer.byteLength,
+  '  edge-offsets.bin bytes:', edgeOffset.buffer.byteLength,
+);
 console.timeEnd('total');

@@ -2,23 +2,34 @@ import { describe, expect, it } from 'vitest';
 import { findReachableRoadNodes } from './carRouter';
 import type { RoadNetwork } from './roadNetwork';
 
-/** Assembles a {@link RoadNetwork} from a list of directed edges alone. */
+/** Assembles a {@link RoadNetwork} (CSR form) from a list of directed edges alone. */
 function buildTestNetwork(
   nodeCount: number,
   edges: [from: number, to: number, seconds: number][],
 ): RoadNetwork {
-  const edgesFromNode: { toNodeIndex: number; travelSeconds: number }[][] = Array.from(
-    { length: nodeCount },
-    () => [],
-  );
-  for (const [from, to, seconds] of edges) {
-    edgesFromNode[from]?.push({ toNodeIndex: to, travelSeconds: seconds });
+  // Group by `from` node, same as build-road-network.mjs's own sort, so the
+  // CSR offsets below line up with edgeToNode/edgeTravelSeconds.
+  const sorted = [...edges].sort((a, b) => a[0] - b[0]);
+
+  const edgeOffset = new Uint32Array(nodeCount + 1);
+  const edgeToNode = new Uint32Array(sorted.length);
+  const edgeTravelSeconds = new Float32Array(sorted.length);
+  for (let index = 0; index < sorted.length; index += 1) {
+    const [from, to, seconds] = sorted[index] as [number, number, number];
+    edgeToNode[index] = to;
+    edgeTravelSeconds[index] = seconds;
+    (edgeOffset[from + 1] as number) += 1;
+  }
+  for (let nodeIndex = 0; nodeIndex < nodeCount; nodeIndex += 1) {
+    (edgeOffset[nodeIndex + 1] as number) += edgeOffset[nodeIndex] as number;
   }
 
   return {
     nodeEastings: new Int32Array(nodeCount),
     nodeNorthings: new Int32Array(nodeCount),
-    edgesFromNode,
+    edgeOffset,
+    edgeToNode,
+    edgeTravelSeconds,
     // Unused by findReachableRoadNodes itself — only the nearest-node snap
     // in the viewer reads this — so a filler value is fine here.
     originEligible: new Uint8Array(nodeCount),
@@ -79,5 +90,22 @@ describe('findReachableRoadNodes', () => {
 
     expect(result.nodes).toContainEqual({ nodeIndex: 0, arrivalSeconds: 0 });
     expect(result.edges.some((edge) => edge.toNodeIndex === 0)).toBe(false);
+  });
+
+  it('getRouteTo returns the full ordered route, the origin as empty, and null for unreached nodes', () => {
+    const network = buildTestNetwork(4, [
+      [0, 1, 100],
+      [1, 2, 100],
+      [2, 3, 100],
+    ]);
+
+    const result = findReachableRoadNodes(network, 0, 250);
+
+    expect(result.getRouteTo(0)).toEqual([]);
+    expect(result.getRouteTo(2)).toEqual([
+      { fromNodeIndex: 0, toNodeIndex: 1, travelSeconds: 100 },
+      { fromNodeIndex: 1, toNodeIndex: 2, travelSeconds: 100 },
+    ]);
+    expect(result.getRouteTo(3)).toBeNull(); // outside the 250s budget
   });
 });
