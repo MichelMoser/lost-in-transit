@@ -308,13 +308,32 @@ function roadCoordinateOf(network: RoadNetwork, nodeIndex: number): [number, num
 }
 
 /**
+ * How close to the budget's own deadline a tip has to land to still count
+ * as one of "the" endpoints — 3 minutes either side of the true maximum.
+ * Every branch technically has a tip (wherever it happens to run out of
+ * network before it runs out of time), but most of those are arbitrary
+ * dead ends reached with plenty of budget still spare, not meaningfully
+ * "how far can I get." Limiting to the real frontier is both the more
+ * honest answer and, for the driving network especially, a much smaller
+ * marker count.
+ */
+const TIP_TIME_TOLERANCE_SECONDS = 3 * 60;
+
+/**
  * Finds every stop the search reached that no drawn leg continues onward
  * from — the actual tip of its arm, rather than a junction passed through on
- * the way to one.
+ * the way to one — restricted to the ones reached close to the budget's own
+ * deadline; see `TIP_TIME_TOLERANCE_SECONDS`.
  */
 function findTipStops(result: TransitReachability): TransitReachability['stops'] {
   const stopsWithOutgoingLeg = new Set(result.legs.map((leg) => leg.fromStopIndex));
-  return result.stops.filter((stop) => !stopsWithOutgoingLeg.has(stop.stopIndex));
+  return result.stops.filter((stop) => {
+    if (stopsWithOutgoingLeg.has(stop.stopIndex)) {
+      return false;
+    }
+    const elapsedSeconds = stop.arrivalSeconds - result.departureSeconds;
+    return result.budgetSeconds - elapsedSeconds <= TIP_TIME_TOLERANCE_SECONDS;
+  });
 }
 
 /**
@@ -322,9 +341,12 @@ function findTipStops(result: TransitReachability): TransitReachability['stops']
  * but a full street network's dead ends are numerous enough (tens of
  * thousands at a typical budget: every cul-de-sac and short residential
  * spur is its own tip) that showing every one would be both visually
- * overwhelming and slow to render and hit-test. Keeping only the
- * latest-arriving tip per grid cell caps the marker count at the network's
- * own geographic footprint rather than its raw dead-end count.
+ * overwhelming and slow to render and hit-test. Restricting to the
+ * `TIP_TIME_TOLERANCE_SECONDS` frontier already does most of that
+ * narrowing (a cul-de-sac reached ten minutes early is no longer a
+ * candidate at all); keeping only the latest-arriving tip per grid cell
+ * on top of that caps whatever is left at the network's own geographic
+ * footprint rather than its raw dead-end count.
  */
 const CAR_TIP_GRID_METERS = 400;
 
@@ -340,6 +362,9 @@ function findTipRoadNodes(
   const bestByCell = new Map<string, CarReachability['nodes'][number]>();
   for (const node of result.nodes) {
     if (hasOutgoingEdge[node.nodeIndex]) {
+      continue;
+    }
+    if (result.budgetSeconds - node.arrivalSeconds > TIP_TIME_TOLERANCE_SECONDS) {
       continue;
     }
 

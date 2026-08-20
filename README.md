@@ -280,9 +280,14 @@ Since the first version, it has grown:
   stop given whatever budget is left after arriving there — not just the
   transit lines, so it reads like isochrone.ch's own filled-area view.
   Toggleable independently from the line network.
-- **Destination tips + hover itinerary** — every arm's actual endpoint gets
-  a marker, and hovering one shows the full point-to-point itinerary: which
-  stop to walk to, which service to board and when, the wait at each
+- **Destination tips + hover itinerary** — restricted to arms whose tip
+  lands within `TIP_TIME_TOLERANCE_SECONDS` (3 minutes) of the budget's own
+  deadline, not every dead end reached along the way: most stops with no
+  onward leg were reached with plenty of budget still spare (they're a
+  branch's end, not "how far can I get"), and for the driving network
+  especially, showing all of them was both visually overwhelming and slow
+  (see bug 9). Hovering a kept tip shows the full point-to-point itinerary:
+  which stop to walk to, which service to board and when, the wait at each
   change, and the final arrival — backed by a real `getJourneyTo(stopIndex)`
   added to the router itself (`src/raptor.ts`), not just viewer-side
   formatting.
@@ -293,8 +298,9 @@ Since the first version, it has grown:
   over the national street graph instead of RAPTOR and draws the result
   differently from transit's hex fill: every reached road segment as its
   own thin, semi-transparent blue stroke, tracing the actual streets rather
-  than an abstracted area, with the furthest point of each branch marked by
-  a ring-and-dot and the origin by a solid dot. The road network itself
+  than an abstracted area, with each branch's own frontier point (see
+  "Destination tips" above) marked by a ring-and-dot and the origin by a
+  solid dot. The road network itself
   (~120MB) is fetched lazily on first switch to car mode, not upfront with
   the transit snapshot, and cached after that — see bugs 9 and 10 below for
   what it took to keep both the render and the mode switch fast at national
