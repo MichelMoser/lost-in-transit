@@ -16,7 +16,7 @@ import { Circle as CircleStyle, Fill, Stroke, Style } from 'ol/style.js';
 import type { MapBrowserEvent } from 'ol';
 
 import { loadTimetable, TransitMode, type Timetable } from '../../src/timetable';
-import { findReachableStops, type TransitReachability } from '../../src/raptor';
+import { findReachableStops, type JourneySegment, type TransitReachability } from '../../src/raptor';
 import { computeIsochroneHexagons } from './isochrone';
 import { formatJourneyHtml } from './journeyFormat';
 import { getLanguage, onLanguageChange, setLanguage, t, type Language } from './translations';
@@ -51,6 +51,8 @@ const tooltipElement = document.getElementById('tooltip') as HTMLDivElement;
 const showIsochroneInput = document.getElementById('showIsochrone') as HTMLInputElement;
 const showNetworkInput = document.getElementById('showNetwork') as HTMLInputElement;
 const languageSelect = document.getElementById('language') as HTMLSelectElement;
+const originDisplayElement = document.getElementById('originDisplay') as HTMLParagraphElement;
+const isochroneEndElement = document.getElementById('isochroneEnd') as HTMLSpanElement;
 
 function setStatus(message: string): void {
   statusElement.textContent = message;
@@ -70,15 +72,21 @@ function applyStaticText(): void {
   (document.getElementById('showIsochroneLabel') as HTMLElement).textContent = t('layer.isochrone');
   (document.getElementById('showNetworkLabel') as HTMLElement).textContent = t('layer.network');
   (document.getElementById('isochroneStart') as HTMLElement).textContent = t('isochrone.start');
-  (document.getElementById('isochroneEnd') as HTMLElement).textContent = t('isochrone.end');
   (document.getElementById('legendRail') as HTMLElement).textContent = t('legend.rail');
   (document.getElementById('legendBus') as HTMLElement).textContent = t('legend.bus');
   (document.getElementById('legendTram') as HTMLElement).textContent = t('legend.tram');
   (document.getElementById('legendFerry') as HTMLElement).textContent = t('legend.ferry');
   (document.getElementById('legendCableCar') as HTMLElement).textContent = t('legend.cableCar');
   (document.getElementById('legendWalking') as HTMLElement).textContent = t('legend.walking');
-  budgetValueElement.textContent = t('budget.minutes', { minutes: budgetInput.value });
+  updateBudgetLabels();
   languageSelect.value = getLanguage();
+}
+
+/** The budget value appears twice — the slider readout and the isochrone legend's red end — kept in sync from one place. */
+function updateBudgetLabels(): void {
+  const text = t('budget.minutes', { minutes: budgetInput.value });
+  budgetValueElement.textContent = text;
+  isochroneEndElement.textContent = text;
 }
 
 // --- Basemap: swisstopo WMTS, grid built by hand rather than through
@@ -127,22 +135,31 @@ const isochroneSource = new VectorSource();
 const isochroneLayer = new VectorLayer({ source: isochroneSource, zIndex: 5 });
 
 /**
- * Colours one hex by how much of the budget was spent reaching it — green
- * for the first stretch, through amber, to red as the deadline nears. The
- * same convention isochrone.ch itself uses, because a reader comparing this
+ * Hue for how much of the budget was spent reaching a point — green for the
+ * first stretch, through amber, to red as the deadline nears. The same
+ * convention isochrone.ch itself uses, because a reader comparing this
  * against a tool they already know should not have to relearn a palette.
+ * Shared between the isochrone hexes and the destination-tip markers so both
+ * read as one consistent scale.
  */
-function isochroneFillStyle(elapsedSeconds: number, budgetSeconds: number): Style {
+function elapsedHue(elapsedSeconds: number, budgetSeconds: number): number {
   const fraction = Math.min(Math.max(elapsedSeconds / budgetSeconds, 0), 1);
-  const hue = 130 * (1 - fraction); // 130 (green) down to 0 (red)
+  return 130 * (1 - fraction); // 130 (green) down to 0 (red)
+}
+
+function isochroneFillStyle(elapsedSeconds: number, budgetSeconds: number): Style {
   return new Style({
-    fill: new Fill({ color: `hsla(${hue}, 75%, 45%, 0.5)` }),
+    fill: new Fill({ color: `hsla(${elapsedHue(elapsedSeconds, budgetSeconds)}, 75%, 45%, 0.5)` }),
   });
 }
 
 // --- Reachability layer -----------------------------------------------------
 const reachabilitySource = new VectorSource();
 const reachabilityLayer = new VectorLayer({ source: reachabilitySource, zIndex: 10 });
+
+/** The single route drawn to whichever tip is currently hovered — see `drawHoverRoute`. */
+const hoverRouteSource = new VectorSource();
+const hoverRouteLayer = new VectorLayer({ source: hoverRouteSource, zIndex: 8 });
 
 const MODE_COLORS: Record<number, string> = {
   [TransitMode.Tram]: '#2980b9',
@@ -176,28 +193,30 @@ const ORIGIN_STYLE = new Style({
   zIndex: 5,
 });
 
-/** A tip: the far end of one arm, where no further leg continues outward. */
-const TIP_STYLE = new Style({
-  image: new CircleStyle({
-    radius: 5,
-    fill: new Fill({ color: '#ffffff' }),
-    stroke: new Stroke({ color: '#111111', width: 2 }),
-  }),
-  zIndex: 4,
-});
-const TIP_HOVER_STYLE = new Style({
-  image: new CircleStyle({
-    radius: 7,
-    fill: new Fill({ color: '#ffe066' }),
-    stroke: new Stroke({ color: '#111111', width: 2 }),
-  }),
-  zIndex: 6,
-});
+/**
+ * A tip: the far end of one arm, where no further leg continues outward.
+ * Filled with the same green-to-red hue as the isochrone hex it sits in, so
+ * a reader can read "how much budget is left here" from the dot alone
+ * without having to hover.
+ */
+function tipStyle(elapsedSeconds: number, budgetSeconds: number, hovered: boolean): Style {
+  const hue = elapsedHue(elapsedSeconds, budgetSeconds);
+  return new Style({
+    image: new CircleStyle({
+      radius: hovered ? 8 : 5,
+      fill: new Fill({ color: `hsl(${hue}, 75%, 45%)` }),
+      stroke: new Stroke({ color: '#111111', width: hovered ? 3 : 2 }),
+    }),
+    zIndex: hovered ? 6 : 4,
+  });
+}
 
 /** Marks a feature so hit-testing can tell a tip circle from a leg or the origin. */
 const ROLE_PROPERTY = 'role';
 const STOP_NAME_PROPERTY = 'stopName';
 const STOP_INDEX_PROPERTY = 'stopIndex';
+const NORMAL_STYLE_PROPERTY = 'normalStyle';
+const HOVER_STYLE_PROPERTY = 'hoverStyle';
 
 function coordinateOf(timetable: Timetable, stopIndex: number): [number, number] {
   return [timetable.stopEastings[stopIndex] ?? 0, timetable.stopNorthings[stopIndex] ?? 0];
@@ -208,11 +227,9 @@ function coordinateOf(timetable: Timetable, stopIndex: number): [number, number]
  * from — the actual tip of its arm, rather than a junction passed through on
  * the way to one.
  */
-function findTipStopIndices(result: TransitReachability): number[] {
+function findTipStops(result: TransitReachability): TransitReachability['stops'] {
   const stopsWithOutgoingLeg = new Set(result.legs.map((leg) => leg.fromStopIndex));
-  return result.stops
-    .map((stop) => stop.stopIndex)
-    .filter((stopIndex) => !stopsWithOutgoingLeg.has(stopIndex));
+  return result.stops.filter((stop) => !stopsWithOutgoingLeg.has(stop.stopIndex));
 }
 
 function drawIsochrone(timetable: Timetable, result: TransitReachability): void {
@@ -232,26 +249,26 @@ function drawIsochrone(timetable: Timetable, result: TransitReachability): void 
   );
 }
 
+/**
+ * Draws only the tips and the origin marker — the legs themselves are not
+ * drawn upfront (every arm at once made the map unreadable at national
+ * scale); `drawHoverRoute` below draws the one route to whichever tip is
+ * currently hovered instead.
+ */
 function drawReachability(timetable: Timetable, result: TransitReachability): void {
   reachabilitySource.clear();
 
-  for (const leg of result.legs) {
-    const feature = new Feature({
-      geometry: new LineString([
-        coordinateOf(timetable, leg.fromStopIndex),
-        coordinateOf(timetable, leg.toStopIndex),
-      ]),
+  for (const stop of findTipStops(result)) {
+    const elapsedSeconds = stop.arrivalSeconds - result.departureSeconds;
+    const tipFeature = new Feature({
+      geometry: new Point(coordinateOf(timetable, stop.stopIndex)),
     });
-    feature.setStyle(legStyle(leg.mode));
-    reachabilitySource.addFeature(feature);
-  }
-
-  for (const stopIndex of findTipStopIndices(result)) {
-    const tipFeature = new Feature({ geometry: new Point(coordinateOf(timetable, stopIndex)) });
     tipFeature.set(ROLE_PROPERTY, 'tip');
-    tipFeature.set(STOP_NAME_PROPERTY, timetable.stopNames[stopIndex] ?? '');
-    tipFeature.set(STOP_INDEX_PROPERTY, stopIndex);
-    tipFeature.setStyle(TIP_STYLE);
+    tipFeature.set(STOP_NAME_PROPERTY, timetable.stopNames[stop.stopIndex] ?? '');
+    tipFeature.set(STOP_INDEX_PROPERTY, stop.stopIndex);
+    tipFeature.set(NORMAL_STYLE_PROPERTY, tipStyle(elapsedSeconds, result.budgetSeconds, false));
+    tipFeature.set(HOVER_STYLE_PROPERTY, tipStyle(elapsedSeconds, result.budgetSeconds, true));
+    tipFeature.setStyle(tipFeature.get(NORMAL_STYLE_PROPERTY) as Style);
     reachabilitySource.addFeature(tipFeature);
   }
 
@@ -260,6 +277,35 @@ function drawReachability(timetable: Timetable, result: TransitReachability): vo
   });
   originFeature.setStyle(ORIGIN_STYLE);
   reachabilitySource.addFeature(originFeature);
+}
+
+/** Draws the point-to-point route to one hovered tip, or clears it when `stopIndex` is `null`. */
+function drawHoverRoute(
+  timetable: Timetable,
+  result: TransitReachability,
+  stopIndex: number | null,
+): void {
+  hoverRouteSource.clear();
+
+  if (stopIndex === null) {
+    return;
+  }
+
+  const journey = result.getJourneyTo(stopIndex);
+  if (!journey) {
+    return;
+  }
+
+  for (const segment of journey as JourneySegment[]) {
+    const feature = new Feature({
+      geometry: new LineString([
+        coordinateOf(timetable, segment.fromStopIndex),
+        coordinateOf(timetable, segment.toStopIndex),
+      ]),
+    });
+    feature.setStyle(legStyle(segment.type === 'walk' ? 'transfer' : segment.mode ?? 'transfer'));
+    hoverRouteSource.addFeature(feature);
+  }
 }
 
 // --- Nearest-stop lookup: brute force, fine for one click at a time. --------
@@ -322,7 +368,7 @@ async function main(): Promise<void> {
 
   const map = new Map({
     target: 'map',
-    layers: [basemapLayer, isochroneLayer, reachabilityLayer],
+    layers: [basemapLayer, isochroneLayer, hoverRouteLayer, reachabilityLayer],
     view,
   });
 
@@ -338,9 +384,13 @@ async function main(): Promise<void> {
    */
   function refreshStatus(): void {
     if (currentOriginIndex !== null && currentResult !== null) {
+      const originName = timetable.stopNames[currentOriginIndex] ?? '';
+      originDisplayElement.textContent = t('journey.from', { name: originName });
+      originDisplayElement.style.display = 'block';
+
       setStatus(
         t('status.result', {
-          name: timetable.stopNames[currentOriginIndex] ?? '',
+          name: originName,
           stops: currentResult.stops.length.toLocaleString(),
           legs: currentResult.legs.length.toLocaleString(),
           ms: lastSearchElapsedMs.toFixed(1),
@@ -349,6 +399,7 @@ async function main(): Promise<void> {
       return;
     }
 
+    originDisplayElement.style.display = 'none';
     setStatus(
       `${t('status.loaded', {
         stops: timetable.stopNames.length.toLocaleString(),
@@ -366,6 +417,7 @@ async function main(): Promise<void> {
     // The redrawn layer holds none of the previous features, so a lingering
     // reference here would style a tip that no longer exists in the source.
     hoveredTip = null;
+    hoverRouteSource.clear();
     tooltipElement.style.display = 'none';
 
     const departureSeconds = departureSecondsFromInput();
@@ -391,15 +443,22 @@ async function main(): Promise<void> {
     refreshStatus();
   });
 
-  // --- Hover: lift a tip and show which station it is. -------------------
+  // --- Hover: lift a tip, show which station it is, and draw the one route
+  // that reaches it — connections are not drawn until a tip is hovered, so
+  // the map at rest shows just the reachable area and its endpoints. -------
   const setHoveredTip = (feature: Feature | null) => {
     if (hoveredTip === feature) {
       return;
     }
 
-    hoveredTip?.setStyle(TIP_STYLE);
+    hoveredTip?.setStyle(hoveredTip.get(NORMAL_STYLE_PROPERTY) as Style);
     hoveredTip = feature;
-    hoveredTip?.setStyle(TIP_HOVER_STYLE);
+    hoveredTip?.setStyle(hoveredTip.get(HOVER_STYLE_PROPERTY) as Style);
+
+    if (currentResult !== null) {
+      const stopIndex = hoveredTip ? (hoveredTip.get(STOP_INDEX_PROPERTY) as number) : null;
+      drawHoverRoute(timetable, currentResult, stopIndex);
+    }
   };
 
   map.on('pointermove', (event: MapBrowserEvent) => {
@@ -453,17 +512,19 @@ async function main(): Promise<void> {
 
   departureInput.addEventListener('change', runSearch);
   budgetInput.addEventListener('input', () => {
-    budgetValueElement.textContent = t('budget.minutes', { minutes: budgetInput.value });
+    updateBudgetLabels();
     runSearch();
   });
 
   isochroneLayer.setVisible(showIsochroneInput.checked);
   reachabilityLayer.setVisible(showNetworkInput.checked);
+  hoverRouteLayer.setVisible(showNetworkInput.checked);
   showIsochroneInput.addEventListener('change', () => {
     isochroneLayer.setVisible(showIsochroneInput.checked);
   });
   showNetworkInput.addEventListener('change', () => {
     reachabilityLayer.setVisible(showNetworkInput.checked);
+    hoverRouteLayer.setVisible(showNetworkInput.checked);
   });
 
   languageSelect.value = getLanguage();
