@@ -100,28 +100,32 @@ Real road-network numbers (motorway + trunk, including slip roads):
 | Stage | Count |
 |---|---|
 | OSM ways in the Overpass export | 18,219 |
-| Distinct nodes used | 148,605 |
-| Directed edges (one-way ways contribute one, two-way contribute two) | 158,747 |
+| Distinct nodes in the raw export | 148,605 |
+| Nodes kept (17 dropped: disconnected islands under 10 nodes) | 148,588 |
+| Directed edges kept | 158,735 |
+| Origin-eligible nodes (SCC ≥ 20 nodes — see bug 7 below) | 91,835 (61.8%) |
 
 Output (`data/output/road-network/`, gitignored — regenerate with
 `npm run build:road-network` once `data/osm-roads-switzerland.json` exists —
 see `scripts/build-road-network.mjs`'s header for the Overpass query):
 
-- `nodes.json` (2.3 MB) — LV95 coordinates, one entry per used node.
+- `nodes.json` (2.3 MB) — LV95 coordinates, one entry per kept node.
 - `edges.bin` (1.9 MB) — every directed edge as a packed `(uint32 from,
   uint32 to, float32 travelSeconds)` triple.
+- `origin-eligible.bin` (145 KB) — one byte per node, 1 or 0 (see bug 7).
 
 Builds in well under a second from the cached Overpass export. A search
 (`findReachableRoadNodes`) runs in **single-digit milliseconds** even
-reaching tens of thousands of junctions — 8ms for 45,278 junctions within 60
-minutes of central Zürich.
+reaching tens of thousands of junctions — 12ms for 39,435 junctions within 60
+minutes of central Bern, 28ms for 96,555 junctions (nearly two-thirds of the
+whole kept network) within 180 minutes.
 
 `src/carRouter.ts` has 4 unit tests against small hand-built graphs
 (`src/carRouter.test.ts`).
 
 ### Bugs found by testing against real data, not just hand-built cases
 
-Six, across the data pipeline and the viewer — worth recording, since none
+Eight, across the data pipeline and the viewer — worth recording, since none
 of them would have surfaced from small examples alone:
 
 1. **CSV quoting.** 57,602 rows in `stops.txt` alone contain a quote
@@ -181,6 +185,38 @@ of them would have surfaced from small examples alone:
    resolved to OpenLayers' map constructor instead, caught immediately by
    `tsc` rather than at runtime. Fixed by importing OpenLayers' class as
    `OlMap`.
+7. **A motorway-grade off-ramp is a real dead end in a motorway-only graph.**
+   Switching the driving isochrone from hex fill to street-following lines
+   (per the project owner's request) surfaced this: clicking a spot in Bern
+   snapped to the nearest node with at least one outgoing edge, which
+   turned out to be the tail end of a `trunk_link` off-ramp
+   ("Tiefenaustrasse") that exits onto an ordinary street this graph
+   doesn't carry — "reached 2 junctions" instead of tens of thousands.
+   "Has an outgoing edge" isn't the same question as "can actually get
+   somewhere," and no small hand-built test graph has ramps subtle enough
+   to expose the gap. Traced the node's real neighbours to confirm it
+   before fixing: node → one `trunk_link` edge → a second node with zero
+   outgoing edges, i.e. a two-node stub. Fixed with Tarjan's
+   strongly-connected-components algorithm (`build-road-network.mjs`): a
+   node only counts as a valid search *origin* if its SCC has at least 20
+   nodes, meaning it can both leave and return rather than dead-end onto
+   an unmapped street. (Checked the actual SCC size distribution rather
+   than guessing the threshold — it barely moves between 5 and 100, a
+   clean gap separates real sub-networks from ramp stubs.) Weak
+   (undirected) connectivity, filtered separately, answers a different
+   question — "is this node reachable at all" — the right one for deciding
+   whether to keep a node as a possible *destination*.
+8. **Six components under 10 nodes were genuinely disconnected islands** —
+   found while investigating bug 7. A short motorway/trunk-tagged segment
+   whose real-world connections at *both* ends are to an unmapped road
+   class becomes its own tiny fragment, unreachable from the rest of the
+   graph in either direction. First instinct was to keep only the single
+   *largest* connected component, which would have discarded 36 other real,
+   sizeable regional networks along with the artifacts — the second-largest
+   alone has 4,842 nodes. Checking the actual size distribution first
+   showed the real fix: every genuine sub-network has 19+ nodes, then a
+   sharp cliff straight to six components of 4 nodes or fewer. Dropped only
+   those.
 
 ## Test viewer
 
@@ -216,11 +252,18 @@ Since the first version, it has grown:
   switcher in the panel, persisted to `localStorage`.
 - **Driving mode** — a Google-Maps-style switch at the top of the panel
   flips between public transport and car. Car mode runs `findReachableRoadNodes`
-  over the motorway/trunk graph instead of RAPTOR, draws the same isochrone
-  hex fill (with its own local-road catchment assumption, see the data
-  source section above) plus every reached road segment coloured on the
-  same green-to-red scale, and keeps each mode's own last result cached so
-  flipping back and forth redraws instantly rather than re-running a search.
+  over the motorway/trunk graph instead of RAPTOR and draws the result
+  differently from transit's hex fill: every reached road segment as its
+  own thin, semi-transparent blue stroke, tracing the actual streets rather
+  than an abstracted area, with the furthest point of each branch marked by
+  a ring-and-dot and the origin by a solid dot. Genuinely overlapping
+  segments (a two-way road's opposite-direction pair, several short
+  segments bunched at an interchange) are separate draw calls, so their
+  alpha composites and the road reads visibly denser there without any
+  per-pixel density computed by hand — up to ~97,000 individual segments in
+  well under a second (see the road-network numbers above). Each mode keeps
+  its own last result cached, so flipping back and forth redraws instantly
+  rather than re-running a search.
 - **Manual stop entry** — a text input with autocomplete over every used
   transit stop's name (transit mode only; road junctions have no name in
   this data), so a reader who knows their starting point does not have to

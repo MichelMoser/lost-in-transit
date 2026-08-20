@@ -6,7 +6,6 @@ import View from 'ol/View.js';
 import Feature from 'ol/Feature.js';
 import Point from 'ol/geom/Point.js';
 import LineString from 'ol/geom/LineString.js';
-import MultiLineString from 'ol/geom/MultiLineString.js';
 import Polygon from 'ol/geom/Polygon.js';
 import VectorLayer from 'ol/layer/Vector.js';
 import VectorSource from 'ol/source/Vector.js';
@@ -20,7 +19,7 @@ import { loadTimetable, TransitMode, type Timetable } from '../../src/timetable'
 import { findReachableStops, type JourneySegment, type TransitReachability } from '../../src/raptor';
 import { loadRoadNetwork, type RoadNetwork } from '../../src/roadNetwork';
 import { findReachableRoadNodes, type CarReachability } from '../../src/carRouter';
-import { computeTransitIsochroneHexagons, computeCarIsochroneHexagons } from './isochrone';
+import { computeTransitIsochroneHexagons } from './isochrone';
 import { formatJourneyHtml } from './journeyFormat';
 import { getLanguage, onLanguageChange, setLanguage, t, type Language } from './translations';
 
@@ -55,6 +54,8 @@ const budgetInput = document.getElementById('budget') as HTMLInputElement;
 const budgetValueElement = document.getElementById('budgetValue') as HTMLSpanElement;
 const tooltipElement = document.getElementById('tooltip') as HTMLDivElement;
 const showIsochroneInput = document.getElementById('showIsochrone') as HTMLInputElement;
+const showIsochroneRowElement = document.getElementById('showIsochroneRow') as HTMLLabelElement;
+const isochroneLegendElement = document.getElementById('isochroneLegend') as HTMLDivElement;
 const showNetworkInput = document.getElementById('showNetwork') as HTMLInputElement;
 const languageSelect = document.getElementById('language') as HTMLSelectElement;
 const originDisplayElement = document.getElementById('originDisplay') as HTMLParagraphElement;
@@ -212,12 +213,44 @@ function legStyle(mode: number | 'transfer'): Style {
   });
 }
 
-/** Road segments are coloured on the same green-to-red scale as everything else, by arrival time at their far end. */
-function carRoadStyle(elapsedSeconds: number, budgetSeconds: number): Style {
-  return new Style({
-    stroke: new Stroke({ color: `hsl(${elapsedHue(elapsedSeconds, budgetSeconds)}, 75%, 45%)`, width: 3 }),
-  });
-}
+/**
+ * Every reached road segment is drawn as its own thin, semi-transparent
+ * blue stroke — a shared `Style` instance, since it never varies per
+ * feature (fresh `Style`/`Stroke` objects per edge would be needless
+ * allocation across tens of thousands of segments). Two edges drawn on top
+ * of each other — a two-way road's opposite-direction pair sharing the same
+ * geometry, or several short segments bunched at an interchange — compose
+ * their alpha on the canvas, so denser road coverage reads visibly darker
+ * without any per-pixel density computed by hand.
+ */
+const CAR_ROAD_STYLE = new Style({
+  stroke: new Stroke({ color: 'rgba(37, 99, 235, 0.35)', width: 1.6 }),
+});
+
+/**
+ * A tip: the furthest point reached along one branch of the road network,
+ * where no further edge continues outward within budget — an outer ring
+ * with a solid black centre dot, distinct from both the transit tips
+ * (coloured by elapsed time) and the origin (a plain solid dot) so all
+ * three read as different things at a glance.
+ */
+const CAR_TIP_STYLE = [
+  new Style({
+    image: new CircleStyle({
+      radius: 6,
+      fill: new Fill({ color: 'rgba(255, 255, 255, 0.9)' }),
+      stroke: new Stroke({ color: '#2563eb', width: 1.5 }),
+    }),
+    zIndex: 4,
+  }),
+  new Style({
+    image: new CircleStyle({
+      radius: 2.5,
+      fill: new Fill({ color: '#111111' }),
+    }),
+    zIndex: 5,
+  }),
+];
 
 const ORIGIN_STYLE = new Style({
   image: new CircleStyle({
@@ -269,6 +302,12 @@ function roadCoordinateOf(network: RoadNetwork, nodeIndex: number): [number, num
 function findTipStops(result: TransitReachability): TransitReachability['stops'] {
   const stopsWithOutgoingLeg = new Set(result.legs.map((leg) => leg.fromStopIndex));
   return result.stops.filter((stop) => !stopsWithOutgoingLeg.has(stop.stopIndex));
+}
+
+/** Same idea as `findTipStops`, for the road network's own reached nodes. */
+function findTipRoadNodes(result: CarReachability): CarReachability['nodes'] {
+  const nodesWithOutgoingEdge = new Set(result.edges.map((edge) => edge.fromNodeIndex));
+  return result.nodes.filter((node) => !nodesWithOutgoingEdge.has(node.nodeIndex));
 }
 
 function drawTransitIsochrone(timetable: Timetable, result: TransitReachability): void {
@@ -347,64 +386,37 @@ function drawHoverRoute(
   }
 }
 
-function drawCarIsochrone(network: RoadNetwork, result: CarReachability): void {
-  isochroneSource.clear();
-
-  const start = performance.now();
-  const hexagons = computeCarIsochroneHexagons(network, result);
-
-  for (const hex of hexagons) {
-    const feature = new Feature({ geometry: new Polygon([hex.ring]) });
-    feature.setStyle(isochroneFillStyle(hex.elapsedSeconds, result.budgetSeconds));
-    isochroneSource.addFeature(feature);
-  }
-
-  console.log(
-    `Car isochrone: ${hexagons.length.toLocaleString()} hexes in ${(performance.now() - start).toFixed(1)}ms`,
-  );
-}
-
-/** Distinct colour steps the reached road network is bucketed into — see `drawCarRoads`. */
-const CAR_ROAD_HUE_BUCKETS = 24;
-
 /**
- * Draws every reached road segment plus the origin marker. A budget wide
- * enough to reach most of the network can mean well over 100,000 directed
- * edges; one OL `Feature` each would be enormously slow to style and render.
- * Bucketing by elapsed time into a small, fixed number of colour steps and
- * drawing each bucket as a single `MultiLineString` keeps the feature count
- * (and so the render cost) constant regardless of how much was reached.
+ * Draws the reached road network as thin lines that follow the actual
+ * streets, plus a ring-and-dot marker at each branch's furthest point and
+ * the usual origin marker — a more street-literal picture than a hex fill,
+ * per the project owner's own request. Every edge is its own stroke, drawn
+ * with the single shared `CAR_ROAD_STYLE` — where edges coincide (a
+ * two-way road's opposite-direction pair, or several short segments
+ * bunched at an interchange), each is still a separate canvas paint
+ * operation, so their alpha composites and the road reads visibly thicker
+ * there without any density computed by hand.
  */
 function drawCarRoads(network: RoadNetwork, result: CarReachability): void {
   carRoadSource.clear();
 
-  const arrivalByNode = new Map<number, number>();
-  for (const node of result.nodes) {
-    arrivalByNode.set(node.nodeIndex, node.arrivalSeconds);
-  }
-
-  const linesByBucket = new Map<number, [number, number][][]>();
   for (const edge of result.edges) {
-    const elapsedSeconds = arrivalByNode.get(edge.toNodeIndex) ?? 0;
-    const fraction = Math.min(Math.max(elapsedSeconds / result.budgetSeconds, 0), 1);
-    const bucket = Math.round(fraction * (CAR_ROAD_HUE_BUCKETS - 1));
-
-    let lines = linesByBucket.get(bucket);
-    if (!lines) {
-      lines = [];
-      linesByBucket.set(bucket, lines);
-    }
-    lines.push([
-      roadCoordinateOf(network, edge.fromNodeIndex),
-      roadCoordinateOf(network, edge.toNodeIndex),
-    ]);
+    const feature = new Feature({
+      geometry: new LineString([
+        roadCoordinateOf(network, edge.fromNodeIndex),
+        roadCoordinateOf(network, edge.toNodeIndex),
+      ]),
+    });
+    feature.setStyle(CAR_ROAD_STYLE);
+    carRoadSource.addFeature(feature);
   }
 
-  for (const [bucket, lines] of linesByBucket) {
-    const elapsedSeconds = (bucket / (CAR_ROAD_HUE_BUCKETS - 1)) * result.budgetSeconds;
-    const feature = new Feature({ geometry: new MultiLineString(lines) });
-    feature.setStyle(carRoadStyle(elapsedSeconds, result.budgetSeconds));
-    carRoadSource.addFeature(feature);
+  for (const node of findTipRoadNodes(result)) {
+    const tipFeature = new Feature({
+      geometry: new Point(roadCoordinateOf(network, node.nodeIndex)),
+    });
+    tipFeature.setStyle(CAR_TIP_STYLE);
+    carRoadSource.addFeature(tipFeature);
   }
 
   const originFeature = new Feature({
@@ -446,6 +458,18 @@ function nearestRoadNodeIndex(network: RoadNetwork, easting: number, northing: n
   let bestDistanceSquared = Infinity;
 
   for (let nodeIndex = 0; nodeIndex < network.nodeEastings.length; nodeIndex += 1) {
+    // Skip nodes that make poor origins — mostly motorway/trunk off-ramps
+    // that exit onto a street outside this graph's scope (see the
+    // road-network data-source note in the README). A plain "has an
+    // outgoing edge" check isn't enough: an off-ramp usually has one or two
+    // and then nowhere further to go. `originEligible` instead marks nodes
+    // in a large enough strongly-connected component to have a real onward
+    // network — built from an actual repro (a click landing on Bern's
+    // Tiefenaustrasse off-ramp gave "reached 2 junctions").
+    if (network.originEligible[nodeIndex] !== 1) {
+      continue;
+    }
+
     const deltaEasting = (network.nodeEastings[nodeIndex] ?? 0) - easting;
     const deltaNorthing = (network.nodeNorthings[nodeIndex] ?? 0) - northing;
     const distanceSquared = deltaEasting ** 2 + deltaNorthing ** 2;
@@ -468,27 +492,31 @@ async function main(): Promise<void> {
   applyStaticText();
   setStatus(t('status.loading'));
 
-  const [manifest, stops, stopTimesBuffer, roadNodes, roadEdgesBuffer] = await Promise.all([
-    // Root-relative, not absolute: GitHub Pages serves this as a project
-    // site under /<repo>/, so an absolute `/data/...` would miss the data
-    // this same deploy carries and instead ask the domain's real root for
-    // it. `BASE_URL` is Vite's own build-time answer to "where am I served
-    // from", already trailing-slashed.
-    fetch(`${import.meta.env.BASE_URL}data/manifest.json`).then((response) => response.json()),
-    fetch(`${import.meta.env.BASE_URL}data/stops.json`).then((response) => response.json()),
-    fetch(`${import.meta.env.BASE_URL}data/stop-times.bin`).then((response) =>
-      response.arrayBuffer(),
-    ),
-    fetch(`${import.meta.env.BASE_URL}data/road-network/nodes.json`).then((response) =>
-      response.json(),
-    ),
-    fetch(`${import.meta.env.BASE_URL}data/road-network/edges.bin`).then((response) =>
-      response.arrayBuffer(),
-    ),
-  ]);
+  const [manifest, stops, stopTimesBuffer, roadNodes, roadEdgesBuffer, originEligibleBuffer] =
+    await Promise.all([
+      // Root-relative, not absolute: GitHub Pages serves this as a project
+      // site under /<repo>/, so an absolute `/data/...` would miss the data
+      // this same deploy carries and instead ask the domain's real root for
+      // it. `BASE_URL` is Vite's own build-time answer to "where am I served
+      // from", already trailing-slashed.
+      fetch(`${import.meta.env.BASE_URL}data/manifest.json`).then((response) => response.json()),
+      fetch(`${import.meta.env.BASE_URL}data/stops.json`).then((response) => response.json()),
+      fetch(`${import.meta.env.BASE_URL}data/stop-times.bin`).then((response) =>
+        response.arrayBuffer(),
+      ),
+      fetch(`${import.meta.env.BASE_URL}data/road-network/nodes.json`).then((response) =>
+        response.json(),
+      ),
+      fetch(`${import.meta.env.BASE_URL}data/road-network/edges.bin`).then((response) =>
+        response.arrayBuffer(),
+      ),
+      fetch(`${import.meta.env.BASE_URL}data/road-network/origin-eligible.bin`).then((response) =>
+        response.arrayBuffer(),
+      ),
+    ]);
 
   const timetable = loadTimetable(manifest, stops, stopTimesBuffer);
-  const roadNetwork = loadRoadNetwork(roadNodes, roadEdgesBuffer);
+  const roadNetwork = loadRoadNetwork(roadNodes, roadEdgesBuffer, originEligibleBuffer);
 
   const basemapLayer = createBasemapLayer(lv95Projection);
   const view = new View({
@@ -596,7 +624,6 @@ async function main(): Promise<void> {
     lastSearchElapsedMs = performance.now() - start;
     carResult = result;
 
-    drawCarIsochrone(roadNetwork, result);
     drawCarRoads(roadNetwork, result);
     refreshStatus();
   }
@@ -732,11 +759,18 @@ async function main(): Promise<void> {
     carRoadLayer.setVisible(currentMode === 'car' && showNetworkInput.checked);
   }
 
-  isochroneLayer.setVisible(showIsochroneInput.checked);
+  // The isochrone hex fill only exists for transit — car mode traces the
+  // road network itself instead (`drawCarRoads`), so the layer, its
+  // checkbox row, and its legend all only make sense in transit mode.
+  function applyIsochroneVisibility(): void {
+    isochroneLayer.setVisible(currentMode === 'transit' && showIsochroneInput.checked);
+    showIsochroneRowElement.style.display = currentMode === 'transit' ? 'flex' : 'none';
+    isochroneLegendElement.style.display = currentMode === 'transit' ? 'block' : 'none';
+  }
+
+  applyIsochroneVisibility();
   applyNetworkLayerVisibility();
-  showIsochroneInput.addEventListener('change', () => {
-    isochroneLayer.setVisible(showIsochroneInput.checked);
-  });
+  showIsochroneInput.addEventListener('change', applyIsochroneVisibility);
   showNetworkInput.addEventListener('change', applyNetworkLayerVisibility);
 
   // --- Mode switch: like Google Maps' travel-mode tabs, each mode keeps its
@@ -758,6 +792,7 @@ async function main(): Promise<void> {
     hoveredTip = null;
     tooltipElement.style.display = 'none';
     applyNetworkLayerVisibility();
+    applyIsochroneVisibility();
 
     if (mode === 'transit') {
       if (transitResult !== null) {
@@ -768,11 +803,10 @@ async function main(): Promise<void> {
         reachabilitySource.clear();
       }
     } else {
+      isochroneSource.clear();
       if (carResult !== null) {
-        drawCarIsochrone(roadNetwork, carResult);
         drawCarRoads(roadNetwork, carResult);
       } else {
-        isochroneSource.clear();
         carRoadSource.clear();
       }
     }

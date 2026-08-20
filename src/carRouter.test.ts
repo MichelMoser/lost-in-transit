@@ -19,6 +19,9 @@ function buildTestNetwork(
     nodeEastings: new Int32Array(nodeCount),
     nodeNorthings: new Int32Array(nodeCount),
     edgesFromNode,
+    // Unused by findReachableRoadNodes itself — only the nearest-node snap
+    // in the viewer reads this — so a filler value is fine here.
+    originEligible: new Uint8Array(nodeCount),
   };
 }
 

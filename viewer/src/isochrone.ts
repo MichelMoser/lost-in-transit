@@ -1,50 +1,28 @@
 /**
- * Business context: turns a reachability result — transit or driving — into
- * the filled-area view isochrone.ch shows, rather than the line network
- * `main.ts` draws on its own. Neither mode's isochrone is the network's own
- * shape: it is the union of a small catchment circle around every reached
- * point, sized to whatever budget is left after arriving there. A point
- * reached with the whole budget still spare (the origin itself) casts a wide
- * circle; one reached in the trip's last minute casts almost none.
+ * Business context: turns a RAPTOR (transit) search into the filled-area
+ * view isochrone.ch shows, rather than the line network `main.ts` draws on
+ * its own. The isochrone is not the transit network's own shape — it is the
+ * union of a walking catchment circle around every reached stop, sized to
+ * whatever budget is left after arriving there. A stop reached with the
+ * whole budget still spare (the origin itself) casts a wide circle; one
+ * reached in the trip's last minute casts almost none.
  *
- * For transit, that catchment is a walk from the stop. For driving, the
- * network is deliberately limited to the motorway/trunk grade (see
- * `build-road-network.mjs`) — the catchment stands in for "the local roads
- * around this junction that aren't in the graph," at a flat estimated speed
- * rather than a real street network.
+ * Driving reachability is drawn differently (`main.ts`'s `drawCarRoads`
+ * traces the actual road network instead) — the road graph reaches far more
+ * discrete points than transit reaches stops, dense enough along each
+ * carriageway that a per-point catchment circle here would be enormous
+ * duplicate work for little visual gain over just drawing the roads
+ * themselves.
  *
- * Computed as a hex grid rather than one circle per point so overlapping
+ * Computed as a hex grid rather than one circle per stop so overlapping
  * catchments merge into one shape and so every cell can report the single
- * best (earliest) arrival time reaching it, whichever point that came from.
+ * best (earliest) arrival time reaching it, whichever stop that came from.
  */
 import type { TransitReachability } from '../../src/raptor';
 import type { Timetable } from '../../src/timetable';
-import type { CarReachability } from '../../src/carRouter';
-import type { RoadNetwork } from '../../src/roadNetwork';
 
 /** Typical pedestrian speed used to size a transit stop's own walking catchment. */
 const WALKING_SPEED_METERS_PER_SECOND = 1.2;
-
-/**
- * Flat stand-in for "local roads not in the motorway/trunk graph," sizing
- * how far a reached junction's own catchment reaches. Not a real street
- * network — a documented approximation, see the module comment above.
- */
-const LOCAL_ROAD_SPEED_METERS_PER_SECOND = 13.9; // 50 km/h
-
-/**
- * Ceiling on how much of the remaining budget turns into a driving
- * junction's own catchment radius, regardless of how much budget is
- * actually left. Without this, a junction reached in the search's first few
- * seconds — there are routinely hundreds of these, immediately around the
- * origin — would each splat a catchment sized off nearly the *entire*
- * budget (tens of kilometres), which is both wildly slow (hundreds of
- * near-duplicate giant splats) and not a believable "local road detour"
- * anyway: nobody leaves the motorway for a 50 km errand on back roads. 15
- * minutes of local driving is a believable detour and keeps every splat
- * cheap.
- */
-const CAR_CATCHMENT_CAP_SECONDS = 900;
 
 /** One coloured cell of the isochrone, ready to draw. */
 export interface IsochroneHex {
@@ -89,24 +67,17 @@ interface IsochroneSource {
 /**
  * Builds the isochrone as a hex grid, one earliest-arrival value per cell.
  *
- * Each reached point "splats" onto only the cells within its own catchment
- * radius rather than every cell testing every point, so a search covering a
+ * Each reached stop "splats" onto only the cells within its own walking
+ * radius rather than every cell testing every stop, so a search covering a
  * whole city costs work proportional to the ground actually covered, not to
- * (points × cells).
+ * (stops × cells).
  *
  * @param originX - Origin easting, in EPSG:2056 metres — the local
  *   coordinate system every hex is centred on.
  * @param originY - Origin northing.
  * @param budgetSeconds - The search's own time budget.
- * @param sources - Every reached point, with elapsed time since the search
+ * @param sources - Every reached stop, with elapsed time since the search
  *   started (the origin itself included, with `elapsedAtArrival: 0`).
- * @param catchmentSpeedMetersPerSecond - How fast the leftover budget at
- *   each point turns into a catchment radius.
- * @param maxCatchmentSeconds - Caps how much leftover budget counts toward
- *   one point's own radius, so a handful of points reached with almost the
- *   whole budget still spare do not each splat a huge circle (transit has
- *   few enough reached stops that this never matters; the road network's
- *   dense node graph needs it, see `computeCarIsochroneHexagons`).
  * @returns One hex per covered cell, coloured by elapsed time in the caller.
  */
 function computeHexagons(
@@ -114,21 +85,16 @@ function computeHexagons(
   originY: number,
   budgetSeconds: number,
   sources: IsochroneSource[],
-  catchmentSpeedMetersPerSecond: number,
-  maxCatchmentSeconds: number = Infinity,
 ): IsochroneHex[] {
   const bestArrivalByHexKey = new Map<string, number>();
 
   for (const source of sources) {
-    const remainingSeconds = Math.min(
-      budgetSeconds - source.elapsedAtArrival,
-      maxCatchmentSeconds,
-    );
+    const remainingSeconds = budgetSeconds - source.elapsedAtArrival;
     if (remainingSeconds <= 0) {
       continue;
     }
 
-    const radius = remainingSeconds * catchmentSpeedMetersPerSecond;
+    const radius = remainingSeconds * WALKING_SPEED_METERS_PER_SECOND;
 
     // Axial range wide enough to cover a square bounding the circle; the
     // per-cell distance check below discards the corners of that square.
@@ -153,7 +119,7 @@ function computeHexagons(
         }
 
         const candidateElapsed =
-          source.elapsedAtArrival + distance / catchmentSpeedMetersPerSecond;
+          source.elapsedAtArrival + distance / WALKING_SPEED_METERS_PER_SECOND;
         const key = `${q}:${r}`;
         const existing = bestArrivalByHexKey.get(key);
 
@@ -196,43 +162,7 @@ export function computeTransitIsochroneHexagons(
     })),
   ];
 
-  return computeHexagons(originX, originY, result.budgetSeconds, sources, WALKING_SPEED_METERS_PER_SECOND);
-}
-
-/** Isochrone for one Dijkstra (driving) search — see `computeHexagons`. */
-export function computeCarIsochroneHexagons(
-  network: RoadNetwork,
-  result: CarReachability,
-): IsochroneHex[] {
-  const originX = network.nodeEastings[result.originNodeIndex] ?? 0;
-  const originY = network.nodeNorthings[result.originNodeIndex] ?? 0;
-
-  // The road graph reaches far more discrete nodes than transit reaches
-  // stops — one source per node would be hundreds of thousands of
-  // near-duplicate splats (neighbouring nodes along the same carriageway
-  // are often metres apart). Bucketing onto the same hex grid the isochrone
-  // itself draws first, keeping only the earliest arrival per cell, caps the
-  // splat count at the network's own footprint rather than its node count.
-  const earliestByHexKey = new Map<string, IsochroneSource>();
-  for (const node of result.nodes) {
-    const x = network.nodeEastings[node.nodeIndex] ?? 0;
-    const y = network.nodeNorthings[node.nodeIndex] ?? 0;
-    const [q, r] = pixelToApproximateAxial(x - originX, y - originY);
-    const key = `${q}:${r}`;
-    const existing = earliestByHexKey.get(key);
-    if (!existing || node.arrivalSeconds < existing.elapsedAtArrival) {
-      earliestByHexKey.set(key, { x, y, elapsedAtArrival: node.arrivalSeconds });
-    }
-  }
-
-  return computeHexagons(
-    originX,
-    originY,
-    result.budgetSeconds,
-    [...earliestByHexKey.values()],
-    LOCAL_ROAD_SPEED_METERS_PER_SECOND,
-    CAR_CATCHMENT_CAP_SECONDS,
-  );
+  return computeHexagons(originX, originY, result.budgetSeconds, sources);
 }
 
 /**

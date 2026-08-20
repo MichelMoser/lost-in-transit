@@ -42,8 +42,8 @@ const en = {
   'legend.cableCar': 'Cable car/Funicular',
   'legend.walking': 'Walking transfer',
   'legend.motorway': 'Motorway / expressway',
-  'legend.carNote':
-    'Only the motorway/expressway network is routed; colour beyond it is an estimate for local roads.',
+  'legend.carTip': 'Furthest reachable point',
+  'legend.carNote': 'Only the motorway/expressway network is routed.',
   'isochrone.start': '0 min',
   'journey.alreadyHere': 'You are already here.',
   'journey.summary': 'Arrive {time} · {minutes} min',
@@ -95,8 +95,8 @@ const fr: Record<TranslationKey, string> = {
   'legend.cableCar': 'Téléphérique/Funiculaire',
   'legend.walking': 'Correspondance à pied',
   'legend.motorway': 'Autoroute / semi-autoroute',
-  'legend.carNote':
-    "Seul le réseau autoroutier/semi-autoroutier est calculé ; la couleur au-delà est une estimation pour les routes locales.",
+  'legend.carTip': 'Point le plus éloigné atteint',
+  'legend.carNote': 'Seul le réseau autoroutier/semi-autoroutier est calculé.',
   'isochrone.start': '0 min',
   'journey.alreadyHere': 'Vous êtes déjà ici.',
   'journey.summary': 'Arrivée {time} · {minutes} min',
@@ -146,8 +146,8 @@ const de: Record<TranslationKey, string> = {
   'legend.cableCar': 'Seilbahn/Standseilbahn',
   'legend.walking': 'Fussweg-Umstieg',
   'legend.motorway': 'Autobahn / Autostrasse',
-  'legend.carNote':
-    'Nur das Autobahn-/Autostrassen-Netz wird berechnet; die Farbe darüber hinaus ist eine Schätzung für lokale Strassen.',
+  'legend.carTip': 'Am weitesten erreichter Punkt',
+  'legend.carNote': 'Nur das Autobahn-/Autostrassen-Netz wird berechnet.',
   'isochrone.start': '0 Min',
   'journey.alreadyHere': 'Sie sind bereits hier.',
   'journey.summary': 'Ankunft {time} · {minutes} Min',

@@ -18,6 +18,16 @@ export interface RoadNetwork {
   nodeNorthings: Int32Array;
   /** Directed adjacency: `edgesFromNode[i]` is every edge leaving node `i`. */
   edgesFromNode: ReadonlyArray<ReadonlyArray<RoadEdge>>;
+  /**
+   * Whether node `i` sits in a large enough strongly-connected component to
+   * make a sensible search origin — 1 if so, 0 otherwise. A plain
+   * "has at least one outgoing edge" check is not enough: a one-way
+   * off-ramp (`highway=trunk_link` etc.) that exits onto a street outside
+   * this graph has an outgoing edge or two and then nowhere further to go,
+   * which a nearest-click origin snap should route around rather than
+   * land on. See `build-road-network.mjs` for how this is computed.
+   */
+  originEligible: Uint8Array;
 }
 
 interface NodesFile {
@@ -31,9 +41,15 @@ interface NodesFile {
  * @param nodes - Parsed `nodes.json`.
  * @param edgesBuffer - Raw bytes of `edges.bin`: 12 bytes per directed edge
  *   (uint32 fromNodeIndex, uint32 toNodeIndex, float32 travelSeconds).
+ * @param originEligibleBuffer - Raw bytes of `origin-eligible.bin`: one byte
+ *   per node, 1 or 0.
  * @returns A network ready for `findReachableRoadNodes`.
  */
-export function loadRoadNetwork(nodes: NodesFile, edgesBuffer: ArrayBuffer): RoadNetwork {
+export function loadRoadNetwork(
+  nodes: NodesFile,
+  edgesBuffer: ArrayBuffer,
+  originEligibleBuffer: ArrayBuffer,
+): RoadNetwork {
   const nodeEastings = Int32Array.from(nodes.eastings);
   const nodeNorthings = Int32Array.from(nodes.northings);
 
@@ -49,5 +65,10 @@ export function loadRoadNetwork(nodes: NodesFile, edgesBuffer: ArrayBuffer): Roa
     edgesFromNode[fromNodeIndex]?.push({ toNodeIndex, travelSeconds });
   }
 
-  return { nodeEastings, nodeNorthings, edgesFromNode };
+  return {
+    nodeEastings,
+    nodeNorthings,
+    edgesFromNode,
+    originEligible: new Uint8Array(originEligibleBuffer),
+  };
 }
