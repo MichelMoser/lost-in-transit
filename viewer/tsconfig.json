@@ -9,5 +9,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "../src"]
+  "include": ["src", "../src"],
+  "exclude": ["../src/raptor.test.ts"]
 }
