@@ -1,0 +1,57 @@
+name: Deploy to GitHub Pages
+
+# The committed data snapshot (viewer/public/data/, ~32MB) is what ships —
+# this workflow only builds the viewer against it. It does not re-run
+# scripts/build-snapshot.mjs, so the reference day stays whatever it was
+# when that snapshot was last committed. See the README's "Hosting" section
+# for how to move to a scheduled rebuild instead.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: viewer/package-lock.json
+
+      - name: Install
+        working-directory: viewer
+        run: npm ci
+
+      - name: Build
+        working-directory: viewer
+        run: npm run build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: viewer/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

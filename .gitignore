@@ -1,0 +1,21 @@
+# Raw GTFS download and its extracted CSVs — regenerate with
+# `npm run build:snapshot`, never commit (the zip alone is >100MB, over
+# GitHub's per-file limit, and the extracted CSVs run past 1.6GB).
+data/gtfs_switzerland.zip
+data/extracted/
+
+# build-snapshot.mjs's output is duplicated verbatim under viewer/public/data/
+# (that copy is what's committed and what GitHub Pages serves) — no need to
+# commit it twice. Regenerate with `npm run build:snapshot`.
+data/output/
+
+node_modules/
+dist/
+
+# Playwright verification artifacts — screenshots and one-off debug scripts
+# written during manual testing, not part of the shipped app.
+viewer/verify*.png
+viewer/verify*.mjs
+viewer/debug*.mjs
+
+.Rhistory
